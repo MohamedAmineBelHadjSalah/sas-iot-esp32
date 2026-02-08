@@ -1,0 +1,15 @@
+# Arduino
+*.bin
+*.elf
+*.hex
+
+# Logs
+*.log
+
+# IDE
+.vscode
+.idea
+
+# OS
+.DS_Store
+Thumbs.db
