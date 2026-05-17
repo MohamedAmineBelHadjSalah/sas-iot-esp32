@@ -1,0 +1,110 @@
+{
+  "ConnectionManager_connections": {
+    "mqtt.eclipse.org": {
+      "configVersion": 1,
+      "certValidation": true,
+      "clientId": "mqtt-explorer-1a11d668",
+      "id": "mqtt.eclipse.org",
+      "name": "mqtt.eclipse.org",
+      "encryption": false,
+      "subscriptions": [
+        {
+          "topic": "#",
+          "qos": 0
+        },
+        {
+          "topic": "$SYS/#",
+          "qos": 0
+        }
+      ],
+      "type": "mqtt",
+      "host": "mqtt.eclipse.org",
+      "port": 1883,
+      "protocol": "mqtt"
+    },
+    "test.mosquitto.org": {
+      "configVersion": 1,
+      "certValidation": true,
+      "clientId": "mqtt-explorer-94ec39ed",
+      "id": "test.mosquitto.org",
+      "name": "test.mosquitto.org",
+      "encryption": false,
+      "subscriptions": [
+        {
+          "topic": "#",
+          "qos": 0
+        },
+        {
+          "topic": "$SYS/#",
+          "qos": 0
+        }
+      ],
+      "type": "mqtt",
+      "host": "test.mosquitto.org",
+      "port": 1883,
+      "protocol": "mqtt"
+    },
+    "b50f0f2b-f603-4f8e-909d-b0c02a1ace9b": {
+      "configVersion": 1,
+      "certValidation": true,
+      "clientId": "PC_MQTT_01",
+      "id": "b50f0f2b-f603-4f8e-909d-b0c02a1ace9b",
+      "name": "SAS_TEST",
+      "encryption": false,
+      "subscriptions": [
+        {
+          "topic": "sas/door1",
+          "qos": 0
+        },
+        {
+          "topic": "sas/door2",
+          "qos": 0
+        },
+        {
+          "topic": "sas/temp",
+          "qos": 0
+        },
+        {
+          "topic": "sas/hum",
+          "qos": 0
+        },
+        {
+          "topic": "sas/access",
+          "qos": 0
+        },
+        {
+          "topic": "sas/state",
+          "qos": 0
+        },
+        {
+          "topic": "sas/control/door1",
+          "qos": 0
+        },
+        {
+          "topic": "sas/control/door2",
+          "qos": 0
+        },
+        {
+          "topic": "sas/esp1/#",
+          "qos": 0
+        },
+        {
+          "topic": "sas/esp2/#",
+          "qos": 0
+        }
+      ],
+      "type": "mqtt",
+      "host": "test.mosquitto.org",
+      "port": 1883,
+      "protocol": "mqtt"
+    }
+  },
+  "Settings": {
+    "timeLocale": "fr",
+    "topicOrder": "#topics",
+    "highlightTopicUpdates": true,
+    "valueRendererDisplayMode": "diff",
+    "selectTopicWithMouseOver": false,
+    "theme": "light"
+  }
+}
