@@ -7,27 +7,22 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
-/* ================= CONFIG PORTE ================= */
-#define DOOR_ID "door2"   // changer en door2, door3...
+#define DOOR_ID "door3"
 
-/* ================= WIFI ================= */
 const char* ssid = "Lenovo16";
 const char* password = "Lenovo16";
 
-/* ================= MQTT ================= */
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-/* ================= NTP ================= */
 const char* ntpServer1 = "pool.ntp.org";
 const char* ntpServer2 = "time.nist.gov";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 0;
 
-/* ================= PINS ================= */
 #define LED_GREEN   25
 #define LED_RED     27
 #define LED_STATUS  21
@@ -52,7 +47,6 @@ const int daylightOffset_sec = 0;
 #define FINGER_RX 16
 #define FINGER_TX 17
 
-/* ================= LOGIC ================= */
 #define MC38_CLOSED LOW
 #define MC38_OPEN   HIGH
 #define PIR_ACTIVE  HIGH
@@ -67,13 +61,11 @@ const unsigned long BUTTON_DEBOUNCE = 300;
 const unsigned long DHT_INTERVAL = 3000;
 const unsigned long HEARTBEAT_TIME = 5000;
 
-/* ================= OBJECTS ================= */
 MFRC522 rfid(RFID_SS, RFID_RST);
 HardwareSerial fingerSerial(2);
 Adafruit_Fingerprint finger(&fingerSerial);
 DHT dht(DHTPIN, DHTTYPE);
 
-/* ================= STATE ================= */
 enum State { READY, OPEN, WAIT, REFUSED };
 State state = READY;
 
@@ -88,13 +80,9 @@ unsigned long lastButtonClose = 0;
 bool relayActive = false;
 bool otherDoorBusy = false;
 
-/* NEW : verrouillage relation Node-RED */
-bool relationLocked = false;
-
 float lastTemp = NAN;
 float lastHum = NAN;
 
-/* ================= DATABASE ================= */
 #define MAX_RFID_USERS 50
 #define MAX_FINGER_USERS 50
 
@@ -118,14 +106,12 @@ struct FingerUser {
   unsigned long allowedTo;
   int maxUses;
   int usedCount;
-  char allowedDoors[120];
   bool used;
 };
 
 RfidUser rfidDb[MAX_RFID_USERS];
 FingerUser fingerDb[MAX_FINGER_USERS];
 
-/* ================= TOPICS ================= */
 String baseTopic() {
   return "sas/" + String(DOOR_ID) + "/";
 }
@@ -134,11 +120,8 @@ String topic(String sub) {
   return baseTopic() + sub;
 }
 
-/* ================= MQTT PUBLISH ================= */
 void publishMsg(String t, String msg, bool retained = false) {
-  if (client.connected()) {
-    client.publish(t.c_str(), msg.c_str(), retained);
-  }
+  if (client.connected()) client.publish(t.c_str(), msg.c_str(), retained);
 }
 
 String stateToString() {
@@ -149,15 +132,8 @@ String stateToString() {
   return "UNKNOWN";
 }
 
-/* ================= LEDs / BUZZER ================= */
 void updateLeds() {
   digitalWrite(LED_STATUS, (WiFi.status() == WL_CONNECTED && client.connected()) ? HIGH : LOW);
-
-  if (relationLocked) {
-    digitalWrite(LED_GREEN, LOW);
-    digitalWrite(LED_RED, HIGH);
-    return;
-  }
 
   if (state == READY || state == OPEN) {
     digitalWrite(LED_GREEN, HIGH);
@@ -184,33 +160,15 @@ void beepDouble() {
   digitalWrite(BUZZER, LOW);
 }
 
-/* ================= DB HELPERS ================= */
 void clearRfidDb() {
   for (int i = 0; i < MAX_RFID_USERS; i++) {
-    rfidDb[i].uid[0] = '\0';
-    rfidDb[i].name[0] = '\0';
-    rfidDb[i].allowedDoors[0] = '\0';
-    rfidDb[i].enabled = false;
-    rfidDb[i].allowedFrom = 0;
-    rfidDb[i].allowedTo = 0;
-    rfidDb[i].maxUses = 0;
-    rfidDb[i].usedCount = 0;
     rfidDb[i].used = false;
+    rfidDb[i].allowedDoors[0] = '\0';
   }
 }
 
 void clearFingerDb() {
-  for (int i = 0; i < MAX_FINGER_USERS; i++) {
-    fingerDb[i].id = -1;
-    fingerDb[i].name[0] = '\0';
-    fingerDb[i].allowedDoors[0] = '\0';
-    fingerDb[i].enabled = false;
-    fingerDb[i].allowedFrom = 0;
-    fingerDb[i].allowedTo = 0;
-    fingerDb[i].maxUses = 0;
-    fingerDb[i].usedCount = 0;
-    fingerDb[i].used = false;
-  }
+  for (int i = 0; i < MAX_FINGER_USERS; i++) fingerDb[i].used = false;
 }
 
 String normalizeUid(String uid) {
@@ -245,7 +203,6 @@ int findFinger(int id) {
   return -1;
 }
 
-/* ================= TIME ================= */
 bool isTimeSynced() {
   time_t now;
   time(&now);
@@ -269,7 +226,6 @@ bool checkTimeAccess(unsigned long from, unsigned long to) {
   return true;
 }
 
-/* ================= ACCESS DOORS ================= */
 bool isDoorAllowedForCard(int idx) {
   String doors = String(rfidDb[idx].allowedDoors);
   doors.trim();
@@ -281,37 +237,16 @@ bool isDoorAllowedForCard(int idx) {
   return doors.indexOf(currentDoor) >= 0;
 }
 
-bool isDoorAllowedForFinger(int idx) {
-  String doors = String(fingerDb[idx].allowedDoors);
-  doors.trim();
-
-  if (doors.length() == 0) return true;
-  if (doors.indexOf("ALL") >= 0) return true;
-
-  String currentDoor = String(DOOR_ID);
-  return doors.indexOf(currentDoor) >= 0;
-}
-
-/* ================= PUBLISH STATE ================= */
 void publishAll() {
   publishMsg(topic("state"), stateToString(), true);
   publishMsg(topic("door"), digitalRead(MC38_PIN) == MC38_OPEN ? "OPEN" : "CLOSED", true);
   publishMsg(topic("pir"), digitalRead(PIR_PIN) == PIR_ACTIVE ? "DETECTED" : "CLEAR", true);
-  publishMsg(topic("lock"), relationLocked ? "LOCKED" : "UNLOCKED", true);
 
   if (!isnan(lastTemp)) publishMsg(topic("temp"), String(lastTemp, 1), true);
   if (!isnan(lastHum)) publishMsg(topic("hum"), String(lastHum, 1), true);
 }
 
-/* ================= DOOR LOGIC ================= */
 bool canOpenDoor() {
-  if (relationLocked) {
-    publishMsg(topic("event"), "refused_relation_locked");
-    publishMsg(topic("lock_status"), "LOCKED", true);
-    beepDouble();
-    return false;
-  }
-
   if (state != READY) {
     publishMsg(topic("event"), "refused_state_not_ready");
     return false;
@@ -424,7 +359,6 @@ void handleStateMachine() {
   }
 }
 
-/* ================= RFID ================= */
 String readUidString() {
   String uid = "";
 
@@ -487,12 +421,13 @@ void handleRfid() {
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
-/* ================= FINGERPRINT ================= */
+
 void handleFinger() {
   uint8_t p = finger.getImage();
 
   if (p == FINGERPRINT_NOFINGER) return;
   if (p != FINGERPRINT_OK) return;
+
   if (finger.image2Tz() != FINGERPRINT_OK) return;
 
   p = finger.fingerSearch();
@@ -514,23 +449,22 @@ void handleFinger() {
     publishMsg(topic("fingerprint_result"), "UNKNOWN");
     setRefused("finger_not_in_db");
   }
+
   else if (!fingerDb[idx].enabled) {
     publishMsg(topic("fingerprint_result"), "DISABLED");
     setRefused("finger_disabled");
   }
+
   else if (!checkTimeAccess(fingerDb[idx].allowedFrom, fingerDb[idx].allowedTo)) {
     publishMsg(topic("fingerprint_result"), "TIME_DENIED");
     setRefused("finger_time_denied");
   }
+
   else if (fingerDb[idx].maxUses > 0 && fingerDb[idx].usedCount >= fingerDb[idx].maxUses) {
     publishMsg(topic("fingerprint_result"), "USE_LIMIT_REACHED");
     setRefused("finger_use_limit");
   }
-  else if (!isDoorAllowedForFinger(idx)) {
-    publishMsg(topic("fingerprint_result"), "DOOR_NOT_ALLOWED");
-    publishMsg(topic("event"), "finger_door_not_allowed");
-    setRefused("door_not_allowed");
-  }
+
   else {
     fingerDb[idx].usedCount++;
 
@@ -541,7 +475,6 @@ void handleFinger() {
   }
 }
 
-/* ================= SENSORS / BUTTONS ================= */
 void handleSensors() {
   publishMsg(topic("door"), digitalRead(MC38_PIN) == MC38_OPEN ? "OPEN" : "CLOSED", true);
   publishMsg(topic("pir"), digitalRead(PIR_PIN) == PIR_ACTIVE ? "DETECTED" : "CLEAR", true);
@@ -577,7 +510,6 @@ void handleButtons() {
   }
 }
 
-/* ================= LOAD DATABASES ================= */
 void loadRfidDb(String json) {
   StaticJsonDocument<16384> doc;
 
@@ -603,6 +535,7 @@ void loadRfidDb(String json) {
 
     if (o["allowedDoors"].is<JsonArray>()) {
       allowedDoors = "";
+
       JsonArray doorsArr = o["allowedDoors"].as<JsonArray>();
 
       for (String d : doorsArr) {
@@ -654,25 +587,10 @@ void loadFingerDb(String json) {
 
     if (id < 0) continue;
 
-    String allowedDoors = "ALL";
-
-    if (o["allowedDoors"].is<JsonArray>()) {
-      allowedDoors = "";
-      JsonArray doorsArr = o["allowedDoors"].as<JsonArray>();
-
-      for (String d : doorsArr) {
-        if (allowedDoors.length() > 0) allowedDoors += ",";
-        allowedDoors += d;
-      }
-    }
-
     fingerDb[i].id = id;
 
     strncpy(fingerDb[i].name, name.c_str(), sizeof(fingerDb[i].name) - 1);
     fingerDb[i].name[sizeof(fingerDb[i].name) - 1] = '\0';
-
-    strncpy(fingerDb[i].allowedDoors, allowedDoors.c_str(), sizeof(fingerDb[i].allowedDoors) - 1);
-    fingerDb[i].allowedDoors[sizeof(fingerDb[i].allowedDoors) - 1] = '\0';
 
     fingerDb[i].enabled = o["enabled"] | true;
     fingerDb[i].allowedFrom = o["allowedFrom"] | 0UL;
@@ -687,7 +605,6 @@ void loadFingerDb(String json) {
   publishMsg(topic("event"), "finger_db_loaded");
 }
 
-/* ================= ENROLL FINGER ================= */
 void enrollFinger(int id) {
   publishMsg(topic("finger_enroll_status"), "put_finger", true);
 
@@ -751,7 +668,6 @@ void clearFingerSensor() {
   }
 }
 
-/* ================= MQTT CALLBACK ================= */
 void mqttCallback(char* top, byte* payload, unsigned int length) {
   String msg = "";
 
@@ -762,27 +678,12 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
 
   if (t == topic("cmd")) {
     if (msg == "OPEN") openDoor("CMD");
+
     else if (msg == "CLOSE") {
       if (state == OPEN) startWaitMode();
     }
-    else if (msg == "RESET") resetDoor();
-  }
 
-  else if (t == topic("lock")) {
-    if (msg == "LOCKED") {
-      relationLocked = true;
-      publishMsg(topic("event"), "relation_locked");
-      publishMsg(topic("lock_status"), "LOCKED", true);
-      beepDouble();
-      updateLeds();
-    }
-    else if (msg == "UNLOCKED") {
-      relationLocked = false;
-      publishMsg(topic("event"), "relation_unlocked");
-      publishMsg(topic("lock_status"), "UNLOCKED", true);
-      beepShort();
-      updateLeds();
-    }
+    else if (msg == "RESET") resetDoor();
   }
 
   else if (t == "sas/rfid/db") {
@@ -807,7 +708,6 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
   }
 }
 
-/* ================= WIFI / MQTT ================= */
 void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -827,7 +727,6 @@ void reconnectMqtt() {
     if (client.connect(clientId.c_str())) {
       client.subscribe(topic("cmd").c_str());
       client.subscribe(topic("finger/cmd").c_str());
-      client.subscribe(topic("lock").c_str());
 
       client.subscribe("sas/rfid/db");
       client.subscribe("sas/finger/db");
@@ -835,7 +734,6 @@ void reconnectMqtt() {
 
       publishMsg(topic("status"), "online", true);
       publishMsg(topic("event"), "boot", true);
-      publishMsg(topic("lock_status"), relationLocked ? "LOCKED" : "UNLOCKED", true);
 
       publishAll();
     } else {
@@ -844,7 +742,6 @@ void reconnectMqtt() {
   }
 }
 
-/* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
 
@@ -894,7 +791,6 @@ void setup() {
   updateLeds();
 }
 
-/* ================= LOOP ================= */
 void loop() {
   if (WiFi.status() != WL_CONNECTED) setupWifi();
   if (!client.connected()) reconnectMqtt();
