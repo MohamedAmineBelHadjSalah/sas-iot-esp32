@@ -6,9 +6,7 @@
 #include <DHT.h>
 #include <ArduinoJson.h>
 #include <time.h>
-
-/* ================= CONFIG PORTE ================= */
-#define DOOR_ID "Porte_urgence"   // changer en door2, door3...
+#include <Preferences.h>
 
 /* ================= WIFI ================= */
 const char* ssid = "Lenovo16";
@@ -20,6 +18,23 @@ const int mqtt_port = 1883;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+Preferences prefs;
+
+/* ================= NOM ESP DYNAMIQUE ================= */
+String deviceId = "";
+String doorId = "";
+
+String makeDeviceId() {
+  return "esp_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+}
+
+String baseTopic() {
+  return "sas/" + doorId + "/";
+}
+
+String topic(String sub) {
+  return baseTopic() + sub;
+}
 
 /* ================= NTP ================= */
 const char* ntpServer1 = "pool.ntp.org";
@@ -87,9 +102,8 @@ unsigned long lastButtonClose = 0;
 
 bool relayActive = false;
 bool otherDoorBusy = false;
-
-/* NEW : verrouillage relation Node-RED */
 bool relationLocked = false;
+bool doorWasPhysicallyOpen = false;
 
 float lastTemp = NAN;
 float lastHum = NAN;
@@ -125,15 +139,6 @@ struct FingerUser {
 RfidUser rfidDb[MAX_RFID_USERS];
 FingerUser fingerDb[MAX_FINGER_USERS];
 
-/* ================= TOPICS ================= */
-String baseTopic() {
-  return "sas/" + String(DOOR_ID) + "/";
-}
-
-String topic(String sub) {
-  return baseTopic() + sub;
-}
-
 /* ================= MQTT PUBLISH ================= */
 void publishMsg(String t, String msg, bool retained = false) {
   if (client.connected()) {
@@ -149,7 +154,7 @@ String stateToString() {
   return "UNKNOWN";
 }
 
-/* ================= LEDs / BUZZER ================= */
+/* ================= LED / BUZZER ================= */
 void updateLeds() {
   digitalWrite(LED_STATUS, (WiFi.status() == WL_CONNECTED && client.connected()) ? HIGH : LOW);
 
@@ -277,8 +282,7 @@ bool isDoorAllowedForCard(int idx) {
   if (doors.length() == 0) return true;
   if (doors.indexOf("ALL") >= 0) return true;
 
-  String currentDoor = String(DOOR_ID);
-  return doors.indexOf(currentDoor) >= 0;
+  return doors.indexOf(doorId) >= 0;
 }
 
 bool isDoorAllowedForFinger(int idx) {
@@ -288,8 +292,7 @@ bool isDoorAllowedForFinger(int idx) {
   if (doors.length() == 0) return true;
   if (doors.indexOf("ALL") >= 0) return true;
 
-  String currentDoor = String(DOOR_ID);
-  return doors.indexOf(currentDoor) >= 0;
+  return doors.indexOf(doorId) >= 0;
 }
 
 /* ================= PUBLISH STATE ================= */
@@ -297,7 +300,10 @@ void publishAll() {
   publishMsg(topic("state"), stateToString(), true);
   publishMsg(topic("door"), digitalRead(MC38_PIN) == MC38_OPEN ? "OPEN" : "CLOSED", true);
   publishMsg(topic("pir"), digitalRead(PIR_PIN) == PIR_ACTIVE ? "DETECTED" : "CLEAR", true);
-  publishMsg(topic("lock"), relationLocked ? "LOCKED" : "UNLOCKED", true);
+  publishMsg(topic("lock_status"), relationLocked ? "LOCKED" : "UNLOCKED", true);
+
+  publishMsg("sas/" + deviceId + "/info", doorId, true);
+  publishMsg("sas/" + deviceId + "/status", "online", true);
 
   if (!isnan(lastTemp)) publishMsg(topic("temp"), String(lastTemp, 1), true);
   if (!isnan(lastHum)) publishMsg(topic("hum"), String(lastHum, 1), true);
@@ -347,6 +353,7 @@ void openDoor(String src) {
     return;
   }
 
+  doorWasPhysicallyOpen = false;
   state = OPEN;
   relayActive = true;
   relayStart = millis();
@@ -378,6 +385,7 @@ void startWaitMode() {
 void resetDoor() {
   digitalWrite(RELAY, RELAY_OFF);
   relayActive = false;
+  doorWasPhysicallyOpen = false;
 
   state = READY;
 
@@ -395,7 +403,12 @@ void handleStateMachine() {
   }
 
   if (state == OPEN) {
-    if (digitalRead(MC38_PIN) == MC38_CLOSED) {
+    if (digitalRead(MC38_PIN) == MC38_OPEN) {
+      doorWasPhysicallyOpen = true;
+    }
+
+    if (doorWasPhysicallyOpen && digitalRead(MC38_PIN) == MC38_CLOSED) {
+      doorWasPhysicallyOpen = false;
       startWaitMode();
     }
   }
@@ -423,17 +436,13 @@ void handleStateMachine() {
     updateLeds();
   }
 }
-
-/* ================= RFID ================= */
 String readUidString() {
   String uid = "";
-
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(rfid.uid.uidByte[i], HEX);
     if (i < rfid.uid.size - 1) uid += ":";
   }
-
   uid.toUpperCase();
   return uid;
 }
@@ -443,7 +452,6 @@ void handleRfid() {
   if (!rfid.PICC_ReadCardSerial()) return;
 
   String uid = readUidString();
-
   publishMsg(topic("rfid"), uid);
   publishMsg(topic("event"), "rfid_detected");
 
@@ -453,41 +461,33 @@ void handleRfid() {
     publishMsg(topic("rfid_result"), "UNKNOWN");
     setRefused("rfid_unknown");
   }
-
   else if (!rfidDb[idx].enabled) {
     publishMsg(topic("rfid_result"), "DISABLED");
     setRefused("rfid_disabled");
   }
-
   else if (!checkTimeAccess(rfidDb[idx].allowedFrom, rfidDb[idx].allowedTo)) {
     publishMsg(topic("rfid_result"), "TIME_DENIED");
     setRefused("rfid_time_denied");
   }
-
   else if (rfidDb[idx].maxUses > 0 && rfidDb[idx].usedCount >= rfidDb[idx].maxUses) {
     publishMsg(topic("rfid_result"), "USE_LIMIT_REACHED");
     setRefused("rfid_use_limit");
   }
-
   else if (!isDoorAllowedForCard(idx)) {
     publishMsg(topic("rfid_result"), "DOOR_NOT_ALLOWED");
-    publishMsg(topic("event"), "rfid_door_not_allowed");
     setRefused("door_not_allowed");
   }
-
   else {
     rfidDb[idx].usedCount++;
-
     publishMsg(topic("rfid_result"), "AUTHORIZED");
     publishMsg(topic("rfid_consume"), uid);
-
     openDoor("RFID");
   }
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
-/* ================= FINGERPRINT ================= */
+
 void handleFinger() {
   uint8_t p = finger.getImage();
 
@@ -504,7 +504,6 @@ void handleFinger() {
   }
 
   int id = finger.fingerID;
-
   publishMsg(topic("fingerprint"), String(id));
   publishMsg(topic("event"), "finger_detected");
 
@@ -528,23 +527,32 @@ void handleFinger() {
   }
   else if (!isDoorAllowedForFinger(idx)) {
     publishMsg(topic("fingerprint_result"), "DOOR_NOT_ALLOWED");
-    publishMsg(topic("event"), "finger_door_not_allowed");
     setRefused("door_not_allowed");
   }
   else {
     fingerDb[idx].usedCount++;
-
     publishMsg(topic("fingerprint_result"), "AUTHORIZED");
     publishMsg(topic("fingerprint_consume"), String(id));
-
     openDoor("FINGER");
   }
 }
 
-/* ================= SENSORS / BUTTONS ================= */
 void handleSensors() {
-  publishMsg(topic("door"), digitalRead(MC38_PIN) == MC38_OPEN ? "OPEN" : "CLOSED", true);
-  publishMsg(topic("pir"), digitalRead(PIR_PIN) == PIR_ACTIVE ? "DETECTED" : "CLEAR", true);
+  static int lastDoor = -1;
+  static int lastPir = -1;
+
+  int doorNow = digitalRead(MC38_PIN);
+  int pirNow = digitalRead(PIR_PIN);
+
+  if (doorNow != lastDoor) {
+    lastDoor = doorNow;
+    publishMsg(topic("door"), doorNow == MC38_OPEN ? "OPEN" : "CLOSED", true);
+  }
+
+  if (pirNow != lastPir) {
+    lastPir = pirNow;
+    publishMsg(topic("pir"), pirNow == PIR_ACTIVE ? "DETECTED" : "CLEAR", true);
+  }
 
   if (millis() - lastDhtRead > DHT_INTERVAL) {
     lastDhtRead = millis();
@@ -572,12 +580,10 @@ void handleButtons() {
 
   if (digitalRead(BUTTON_CLOSE) == LOW && millis() - lastButtonClose > BUTTON_DEBOUNCE) {
     lastButtonClose = millis();
-
     if (state == OPEN) startWaitMode();
   }
 }
 
-/* ================= LOAD DATABASES ================= */
 void loadRfidDb(String json) {
   StaticJsonDocument<16384> doc;
 
@@ -587,7 +593,6 @@ void loadRfidDb(String json) {
   }
 
   clearRfidDb();
-
   JsonArray arr = doc.as<JsonArray>();
   int i = 0;
 
@@ -596,7 +601,6 @@ void loadRfidDb(String json) {
 
     String uid = normalizeUid(o["uid"] | "");
     String name = o["name"] | "";
-
     if (uid.length() == 0) continue;
 
     String allowedDoors = "ALL";
@@ -642,7 +646,6 @@ void loadFingerDb(String json) {
   }
 
   clearFingerDb();
-
   JsonArray arr = doc.as<JsonArray>();
   int i = 0;
 
@@ -687,7 +690,6 @@ void loadFingerDb(String json) {
   publishMsg(topic("event"), "finger_db_loaded");
 }
 
-/* ================= ENROLL FINGER ================= */
 void enrollFinger(int id) {
   publishMsg(topic("finger_enroll_status"), "put_finger", true);
 
@@ -751,7 +753,15 @@ void clearFingerSensor() {
   }
 }
 
-/* ================= MQTT CALLBACK ================= */
+bool validName(String n) {
+  n.trim();
+  if (n.length() == 0) return false;
+  if (n.indexOf("/") >= 0) return false;
+  if (n.indexOf("+") >= 0) return false;
+  if (n.indexOf("#") >= 0) return false;
+  return true;
+}
+
 void mqttCallback(char* top, byte* payload, unsigned int length) {
   String msg = "";
 
@@ -760,7 +770,18 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
 
   String t = String(top);
 
-  if (t == topic("cmd")) {
+  if (t == "sas/" + deviceId + "/config/name" || t == "sas/" + doorId + "/config/name") {
+    if (validName(msg)) {
+      prefs.putString("doorId", msg);
+      publishMsg("sas/" + deviceId + "/config/status", "name_saved_restart", true);
+      delay(500);
+      ESP.restart();
+    } else {
+      publishMsg("sas/" + deviceId + "/config/status", "invalid_name", true);
+    }
+  }
+
+  else if (t == topic("cmd")) {
     if (msg == "OPEN") openDoor("CMD");
     else if (msg == "CLOSE") {
       if (state == OPEN) startWaitMode();
@@ -800,14 +821,15 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
   }
 
   else if (t.startsWith("sas/") && t.endsWith("/state")) {
-    if (t != topic("state")) {
+    String other = t.substring(4, t.length() - 6);
+
+    if (other != doorId && other != deviceId) {
       if (msg == "OPEN" || msg == "WAIT") otherDoorBusy = true;
       if (msg == "READY" || msg == "REFUSED") otherDoorBusy = false;
     }
   }
 }
 
-/* ================= WIFI / MQTT ================= */
 void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -822,12 +844,15 @@ void reconnectMqtt() {
   while (!client.connected()) {
     updateLeds();
 
-    String clientId = "SAS_" + String(DOOR_ID) + "_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    String clientId = "SAS_" + deviceId;
 
     if (client.connect(clientId.c_str())) {
       client.subscribe(topic("cmd").c_str());
       client.subscribe(topic("finger/cmd").c_str());
       client.subscribe(topic("lock").c_str());
+
+      client.subscribe(("sas/" + deviceId + "/config/name").c_str());
+      client.subscribe(("sas/" + doorId + "/config/name").c_str());
 
       client.subscribe("sas/rfid/db");
       client.subscribe("sas/finger/db");
@@ -837,6 +862,9 @@ void reconnectMqtt() {
       publishMsg(topic("event"), "boot", true);
       publishMsg(topic("lock_status"), relationLocked ? "LOCKED" : "UNLOCKED", true);
 
+      publishMsg("sas/" + deviceId + "/info", doorId, true);
+      publishMsg("sas/" + deviceId + "/status", "online", true);
+
       publishAll();
     } else {
       delay(2000);
@@ -844,9 +872,16 @@ void reconnectMqtt() {
   }
 }
 
-/* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
+
+  prefs.begin("sas_config", false);
+
+  deviceId = makeDeviceId();
+  doorId = prefs.getString("doorId", deviceId);
+
+  Serial.println("Device ID: " + deviceId);
+  Serial.println("Door ID: " + doorId);
 
   clearRfidDb();
   clearFingerDb();
@@ -894,7 +929,6 @@ void setup() {
   updateLeds();
 }
 
-/* ================= LOOP ================= */
 void loop() {
   if (WiFi.status() != WL_CONNECTED) setupWifi();
   if (!client.connected()) reconnectMqtt();
@@ -914,6 +948,7 @@ void loop() {
     lastHeartbeat = millis();
 
     publishMsg(topic("status"), "online", true);
+    publishMsg("sas/" + deviceId + "/status", "online", true);
     publishAll();
     updateLeds();
   }
