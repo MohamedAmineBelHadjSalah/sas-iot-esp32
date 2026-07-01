@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <SPI.h>
+#include <SD.h>
+#include <FS.h>
 #include <MFRC522.h>
 #include <Adafruit_Fingerprint.h>
 #include <DHT.h>
@@ -19,6 +21,28 @@ const int mqtt_port = 1883;
 WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences prefs;
+
+/* ================= SD CARD - SPI SEPARE ================= */
+/*
+SD SCK  -> GPIO27
+SD MISO -> GPIO35
+SD MOSI -> GPIO15
+SD CS   -> GPIO2
+*/
+
+SPIClass spiSD(HSPI);
+
+#define SD_SCK  27
+#define SD_MISO 35
+#define SD_MOSI 15
+#define SD_CS   2
+
+bool sdReady = false;
+
+const char* LOG_FILE = "/log.txt";
+const char* RFID_FILE = "/rfid_db.json";
+const char* FINGER_FILE = "/finger_db.json";
+const char* CONFIG_FILE = "/config.json";
 
 /* ================= NOM ESP DYNAMIQUE ================= */
 String deviceId = "";
@@ -44,11 +68,11 @@ const int daylightOffset_sec = 0;
 
 /* ================= PINS ================= */
 #define LED_GREEN   25
-#define LED_RED     27
+#define LED_RED     12
 #define LED_STATUS  21
 
 #define BUTTON_OPEN   13
-#define BUTTON_CLOSE  35
+#define BUTTON_CLOSE  26
 
 #define BUZZER 4
 #define RELAY  14
@@ -58,6 +82,7 @@ const int daylightOffset_sec = 0;
 #define DHTPIN   32
 #define DHTTYPE  DHT11
 
+/* RFID garde son SPI */
 #define RFID_SS   5
 #define RFID_RST  22
 #define RFID_SCK  18
@@ -139,8 +164,87 @@ struct FingerUser {
 RfidUser rfidDb[MAX_RFID_USERS];
 FingerUser fingerDb[MAX_FINGER_USERS];
 
+/* ================= SD FUNCTIONS ================= */
+void logSD(String text) {
+  if (!sdReady) return;
+
+  File f = SD.open(LOG_FILE, FILE_APPEND);
+  if (!f) return;
+
+  f.print(millis());
+  f.print(" | ");
+  f.println(text);
+  f.close();
+}
+
+bool writeFileSD(const char* path, String data) {
+  if (!sdReady) return false;
+
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    Serial.println("SD write error: " + String(path));
+    return false;
+  }
+
+  f.print(data);
+  f.close();
+
+  logSD("SAVE FILE: " + String(path));
+  return true;
+}
+
+String readFileSD(const char* path) {
+  if (!sdReady) return "";
+
+  File f = SD.open(path);
+  if (!f) return "";
+
+  String data = f.readString();
+  f.close();
+
+  logSD("READ FILE: " + String(path));
+  return data;
+}
+
+void saveConfigToSD() {
+  if (!sdReady) return;
+
+  StaticJsonDocument<512> doc;
+  doc["deviceId"] = deviceId;
+  doc["doorId"] = doorId;
+
+  String out;
+  serializeJson(doc, out);
+
+  writeFileSD(CONFIG_FILE, out);
+}
+
+void initSD() {
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  if (SD.begin(SD_CS, spiSD)) {
+    sdReady = true;
+    Serial.println("SD OK");
+
+    File f = SD.open(LOG_FILE, FILE_APPEND);
+    if (f) {
+      f.println("===== ESP START =====");
+      f.println("Device ID: " + deviceId);
+      f.println("Door ID: " + doorId);
+      f.close();
+    }
+
+    saveConfigToSD();
+  } else {
+    sdReady = false;
+    Serial.println("SD ERROR");
+  }
+}
+
 /* ================= MQTT PUBLISH ================= */
 void publishMsg(String t, String msg, bool retained = false) {
+  logSD(t + " = " + msg);
+
   if (client.connected()) {
     client.publish(t.c_str(), msg.c_str(), retained);
   }
@@ -264,7 +368,7 @@ unsigned long nowEpoch() {
 }
 
 bool checkTimeAccess(unsigned long from, unsigned long to) {
-  if (!isTimeSynced()) return false;
+  if (!isTimeSynced()) return true;
 
   unsigned long now = nowEpoch();
 
@@ -303,35 +407,22 @@ void publishAll() {
   publishMsg(topic("lock_status"), relationLocked ? "LOCKED" : "UNLOCKED", true);
 
   publishMsg("sas/" + deviceId + "/info", doorId, true);
-  publishMsg("sas/" + deviceId + "/status", "online", true);
+  publishMsg("sas/" + deviceId + "/status", WiFi.status() == WL_CONNECTED ? "online" : "offline", true);
 
   if (!isnan(lastTemp)) publishMsg(topic("temp"), String(lastTemp, 1), true);
   if (!isnan(lastHum)) publishMsg(topic("hum"), String(lastHum, 1), true);
 }
-
 /* ================= DOOR LOGIC ================= */
 bool canOpenDoor() {
   if (relationLocked) {
     publishMsg(topic("event"), "refused_relation_locked");
-    publishMsg(topic("lock_status"), "LOCKED", true);
     beepDouble();
     return false;
   }
 
-  if (state != READY) {
-    publishMsg(topic("event"), "refused_state_not_ready");
-    return false;
-  }
-
-  if (digitalRead(MC38_PIN) == MC38_OPEN) {
-    publishMsg(topic("event"), "refused_local_door_open");
-    return false;
-  }
-
-  if (otherDoorBusy) {
-    publishMsg(topic("event"), "refused_other_door_busy");
-    return false;
-  }
+  if (state != READY) return false;
+  if (digitalRead(MC38_PIN) == MC38_OPEN) return false;
+  if (otherDoorBusy) return false;
 
   return true;
 }
@@ -421,11 +512,9 @@ void handleStateMachine() {
 
     if (millis() - waitStart > WAIT_TIME) {
       state = READY;
-
       publishMsg(topic("state"), "READY", true);
       publishMsg(topic("wait"), "-1", true);
       publishMsg(topic("event"), "state_ready");
-
       updateLeds();
     }
   }
@@ -436,13 +525,17 @@ void handleStateMachine() {
     updateLeds();
   }
 }
+
+/* ================= RFID ================= */
 String readUidString() {
   String uid = "";
+
   for (byte i = 0; i < rfid.uid.size; i++) {
     if (rfid.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(rfid.uid.uidByte[i], HEX);
     if (i < rfid.uid.size - 1) uid += ":";
   }
+
   uid.toUpperCase();
   return uid;
 }
@@ -452,6 +545,7 @@ void handleRfid() {
   if (!rfid.PICC_ReadCardSerial()) return;
 
   String uid = readUidString();
+
   publishMsg(topic("rfid"), uid);
   publishMsg(topic("event"), "rfid_detected");
 
@@ -488,6 +582,7 @@ void handleRfid() {
   rfid.PCD_StopCrypto1();
 }
 
+/* ================= FINGERPRINT ================= */
 void handleFinger() {
   uint8_t p = finger.getImage();
 
@@ -504,6 +599,7 @@ void handleFinger() {
   }
 
   int id = finger.fingerID;
+
   publishMsg(topic("fingerprint"), String(id));
   publishMsg(topic("event"), "finger_detected");
 
@@ -537,6 +633,7 @@ void handleFinger() {
   }
 }
 
+/* ================= SENSORS / BUTTONS ================= */
 void handleSensors() {
   static int lastDoor = -1;
   static int lastPir = -1;
@@ -584,6 +681,7 @@ void handleButtons() {
   }
 }
 
+/* ================= LOAD DATABASES ================= */
 void loadRfidDb(String json) {
   StaticJsonDocument<16384> doc;
 
@@ -593,6 +691,7 @@ void loadRfidDb(String json) {
   }
 
   clearRfidDb();
+
   JsonArray arr = doc.as<JsonArray>();
   int i = 0;
 
@@ -601,6 +700,7 @@ void loadRfidDb(String json) {
 
     String uid = normalizeUid(o["uid"] | "");
     String name = o["name"] | "";
+
     if (uid.length() == 0) continue;
 
     String allowedDoors = "ALL";
@@ -634,7 +734,8 @@ void loadRfidDb(String json) {
     i++;
   }
 
-  publishMsg(topic("event"), "rfid_db_loaded");
+  writeFileSD(RFID_FILE, json);
+  publishMsg(topic("event"), "rfid_db_loaded_sd_saved");
 }
 
 void loadFingerDb(String json) {
@@ -646,6 +747,7 @@ void loadFingerDb(String json) {
   }
 
   clearFingerDb();
+
   JsonArray arr = doc.as<JsonArray>();
   int i = 0;
 
@@ -687,9 +789,19 @@ void loadFingerDb(String json) {
     i++;
   }
 
-  publishMsg(topic("event"), "finger_db_loaded");
+  writeFileSD(FINGER_FILE, json);
+  publishMsg(topic("event"), "finger_db_loaded_sd_saved");
 }
 
+void loadDatabasesFromSD() {
+  String rfidJson = readFileSD(RFID_FILE);
+  if (rfidJson.length() > 5) loadRfidDb(rfidJson);
+
+  String fingerJson = readFileSD(FINGER_FILE);
+  if (fingerJson.length() > 5) loadFingerDb(fingerJson);
+}
+
+/* ================= ENROLL FINGER ================= */
 void enrollFinger(int id) {
   publishMsg(topic("finger_enroll_status"), "put_finger", true);
 
@@ -753,6 +865,7 @@ void clearFingerSensor() {
   }
 }
 
+/* ================= MQTT CALLBACK ================= */
 bool validName(String n) {
   n.trim();
   if (n.length() == 0) return false;
@@ -773,6 +886,8 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
   if (t == "sas/" + deviceId + "/config/name" || t == "sas/" + doorId + "/config/name") {
     if (validName(msg)) {
       prefs.putString("doorId", msg);
+      doorId = msg;
+      saveConfigToSD();
       publishMsg("sas/" + deviceId + "/config/status", "name_saved_restart", true);
       delay(500);
       ESP.restart();
@@ -830,17 +945,22 @@ void mqttCallback(char* top, byte* payload, unsigned int length) {
   }
 }
 
+/* ================= WIFI / MQTT ================= */
 void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
     delay(500);
     updateLeds();
   }
 }
 
 void reconnectMqtt() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
   while (!client.connected()) {
     updateLeds();
 
@@ -868,10 +988,12 @@ void reconnectMqtt() {
       publishAll();
     } else {
       delay(2000);
+      return;
     }
   }
 }
 
+/* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
 
@@ -902,6 +1024,9 @@ void setup() {
   digitalWrite(RELAY, RELAY_OFF);
   digitalWrite(BUZZER, LOW);
 
+  initSD();
+  loadDatabasesFromSD();
+
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
 
@@ -912,13 +1037,15 @@ void setup() {
 
   setupWifi();
 
-  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
 
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-  client.setBufferSize(4096);
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+    client.setBufferSize(4096);
 
-  reconnectMqtt();
+    reconnectMqtt();
+  }
 
   if (finger.verifyPassword()) {
     publishMsg(topic("event"), "finger_sensor_ok");
@@ -929,11 +1056,14 @@ void setup() {
   updateLeds();
 }
 
+/* ================= LOOP ================= */
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) setupWifi();
-  if (!client.connected()) reconnectMqtt();
-
-  client.loop();
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) reconnectMqtt();
+    client.loop();
+  } else {
+    setupWifi();
+  }
 
   handleStateMachine();
   handleSensors();
@@ -947,8 +1077,8 @@ void loop() {
   if (millis() - lastHeartbeat > HEARTBEAT_TIME) {
     lastHeartbeat = millis();
 
-    publishMsg(topic("status"), "online", true);
-    publishMsg("sas/" + deviceId + "/status", "online", true);
+    publishMsg(topic("status"), WiFi.status() == WL_CONNECTED ? "online" : "offline", true);
+    publishMsg("sas/" + deviceId + "/status", WiFi.status() == WL_CONNECTED ? "online" : "offline", true);
     publishAll();
     updateLeds();
   }
