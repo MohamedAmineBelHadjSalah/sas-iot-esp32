@@ -11,6 +11,13 @@
 #include <Preferences.h>
 
 /* =========================================================
+   MCP23017 + AUDIO
+   ========================================================= */
+#include <Wire.h>
+#include <Adafruit_MCP23X17.h>
+#include <ESP_I2S.h>
+
+/* =========================================================
    WIFI
    ========================================================= */
 const char* ssid = "Lenovo16";
@@ -26,8 +33,59 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 Preferences prefs;
 
+const bool USE_GLOBAL_DOOR_STATE_LOCK = false;
+
 /* =========================================================
-   SPI PRINCIPAL : 2 RFID
+   MCP23017
+   ========================================================= */
+#define I2C_SDA          21
+#define I2C_SCL          25
+#define MCP_ADDRESS      0x20
+
+#define MCP_LED_GREEN     0   // GPA0
+#define MCP_LED_RED       1   // GPA1
+#define MCP_BUTTON        2   // GPA2
+
+Adafruit_MCP23X17 mcp;
+
+bool mcpReady = false;
+
+/* =========================================================
+   MAX98357A
+   ========================================================= */
+
+/*
+   Cablage deja teste :
+
+   GPIO12 -> BCLK
+   GPIO4  -> LRC / WS
+   GPIO2  -> DIN
+*/
+#define I2S_BCLK         12
+#define I2S_LRC           4
+#define I2S_DOUT          2
+
+#define AUDIO_SAMPLE_RATE 44100
+
+I2SClass I2S;
+
+bool audioReady = false;
+
+/* =========================================================
+   FICHIERS AUDIO SD
+   ========================================================= */
+
+const char* AUDIO_DOOR_OPEN =
+  "/porte_ouverte.wav";
+
+const char* AUDIO_DOOR_CLOSED =
+  "/porte_fermee.wav";
+
+const char* AUDIO_ACCESS_DENIED =
+  "/acces_refuse.wav";
+
+/* =========================================================
+   SPI PRINCIPAL : DEUX RFID
    ========================================================= */
 #define RFID_SCK       18
 #define RFID_MISO      19
@@ -37,8 +95,15 @@ Preferences prefs;
 #define RFID_OUT_SS    27
 #define RFID_RST       22
 
-MFRC522 rfidIn(RFID_IN_SS, RFID_RST);
-MFRC522 rfidOut(RFID_OUT_SS, RFID_RST);
+MFRC522 rfidIn(
+  RFID_IN_SS,
+  RFID_RST
+);
+
+MFRC522 rfidOut(
+  RFID_OUT_SS,
+  RFID_RST
+);
 
 /* =========================================================
    SPI SEPARE : CARTE SD
@@ -52,63 +117,100 @@ SPIClass spiSD(HSPI);
 
 bool sdReady = false;
 
-const char* LOG_FILE = "/log.txt";
-const char* ACCESS_HISTORY_FILE = "/access_history.csv";
-const char* RFID_FILE = "/rfid_db.json";
-const char* FINGER_FILE = "/finger_db.json";
-const char* CONFIG_FILE = "/config.json";
+const char* LOG_FILE =
+  "/log.txt";
+
+const char* ACCESS_HISTORY_FILE =
+  "/access_history.csv";
+
+const char* PENDING_EVENTS_FILE =
+  "/pending_events.ndjson";
+
+const char* PENDING_TEMP_FILE =
+  "/pending_temp.ndjson";
+
+const char* RFID_FILE =
+  "/rfid_db.json";
+
+const char* FINGER_FILE =
+  "/finger_db.json";
+
+const char* CONFIG_FILE =
+  "/config.json";
 
 /* =========================================================
-   IDENTIFIANTS ESP / PORTE
+   SYNCHRONISATION DES EVENEMENTS
+   ========================================================= */
+const unsigned long SYNC_RETRY_TIME = 5000;
+const unsigned long SYNC_CHECK_TIME = 1000;
+
+bool waitingAccessAck = false;
+
+String waitingEventId = "";
+String waitingEventJson = "";
+
+unsigned long lastSyncPublish = 0;
+unsigned long lastSyncCheck = 0;
+
+/* =========================================================
+   IDENTIFIANTS
    ========================================================= */
 String deviceId = "";
 String doorId = "";
 
 String makeDeviceId() {
-  return "esp_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+
+  uint64_t chipId =
+    ESP.getEfuseMac();
+
+  uint32_t shortId =
+    (uint32_t)(
+      chipId ^
+      (chipId >> 32)
+    );
+
+  return
+    "esp_" +
+    String(
+      shortId,
+      HEX
+    );
 }
 
 String baseTopic() {
-  return "sas/" + doorId + "/";
+
+  return
+    "sas/" +
+    doorId +
+    "/";
 }
 
-String topic(String sub) {
-  return baseTopic() + sub;
+String topic(
+  const String& sub
+) {
+
+  return
+    baseTopic() +
+    sub;
 }
 
 /* =========================================================
    NTP
    ========================================================= */
-const char* ntpServer1 = "pool.ntp.org";
-const char* ntpServer2 = "time.nist.gov";
+const char* ntpServer1 =
+  "pool.ntp.org";
+
+const char* ntpServer2 =
+  "time.nist.gov";
 
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 0;
 
 /* =========================================================
-   PINS
+   PINS ESP32 RESTANTS
    ========================================================= */
-#define LED_GREEN      25
-#define LED_RED        12
-#define LED_STATUS     21
-
-/*
-   GPIO36 = SP / VP
-   GPIO39 = SN / VN
-
-   Résistance externe de 10 kΩ vers 3.3 V obligatoire.
-   Bouton entre GPIO et GND.
-*/
-#define BUTTON_OPEN    36
-#define BUTTON_CLOSE   39
-
-#define BUZZER          4
 #define RELAY          14
 
-/*
-   GPIO34 nécessite aussi une résistance externe de 10 kΩ
-   vers 3.3 V pour le contact MC38.
-*/
 #define MC38_PIN       34
 #define PIR_PIN        33
 
@@ -119,8 +221,15 @@ const int daylightOffset_sec = 0;
 #define FINGER_TX      17
 
 HardwareSerial fingerSerial(2);
-Adafruit_Fingerprint finger(&fingerSerial);
-DHT dht(DHTPIN, DHTTYPE);
+
+Adafruit_Fingerprint finger(
+  &fingerSerial
+);
+
+DHT dht(
+  DHTPIN,
+  DHTTYPE
+);
 
 /* =========================================================
    LOGIQUE ELECTRIQUE
@@ -134,115 +243,689 @@ DHT dht(DHTPIN, DHTTYPE);
 #define RELAY_OFF   LOW
 
 /* =========================================================
-   TEMPS
+   TEMPORISATIONS
    ========================================================= */
-const unsigned long WAIT_TIME = 4000;
-const unsigned long RELAY_TIME = 1200;
-const unsigned long REFUSED_TIME = 1500;
-const unsigned long BUTTON_DEBOUNCE = 80;
-const unsigned long DHT_INTERVAL = 3000;
-const unsigned long HEARTBEAT_TIME = 5000;
-const unsigned long MQTT_RECONNECT_TIME = 3000;
-const unsigned long WIFI_RECONNECT_TIME = 10000;
+const unsigned long WAIT_TIME =
+  4000;
+
+const unsigned long RELAY_TIME =
+  1200;
+
+const unsigned long REFUSED_TIME =
+  1500;
+
+const unsigned long BUTTON_DEBOUNCE =
+  80;
+
+const unsigned long DHT_INTERVAL =
+  3000;
+
+const unsigned long HEARTBEAT_TIME =
+  5000;
+
+const unsigned long MQTT_RECONNECT_TIME =
+  5000;
+
+const unsigned long WIFI_RECONNECT_TIME =
+  15000;
 
 /* =========================================================
-   ETAT
+   ETAT PORTE
    ========================================================= */
 enum State {
+
   READY,
   OPEN,
   WAIT,
   REFUSED
 };
 
-State state = READY;
+State state =
+  READY;
 
 unsigned long waitStart = 0;
 unsigned long relayStart = 0;
 unsigned long refusedStart = 0;
+
 unsigned long lastDhtRead = 0;
 unsigned long lastHeartbeat = 0;
+
 unsigned long lastMqttReconnect = 0;
 unsigned long lastWifiReconnect = 0;
 
-long lastWaitRemain = -2;
+long lastWaitRemain =
+  -2;
 
-bool relayActive = false;
-bool otherDoorBusy = false;
-bool relationLocked = false;
-bool doorWasPhysicallyOpen = false;
+bool relayActive =
+  false;
+
+bool otherDoorBusy =
+  false;
+
+bool relationLocked =
+  false;
+
+bool doorWasPhysicallyOpen =
+  false;
 
 float lastTemp = NAN;
 float lastHum = NAN;
 
 /* =========================================================
-   ANTIREBOND BOUTONS
+   BOUTON MCP23017
    ========================================================= */
-int openStableState = HIGH;
-int openCandidateState = HIGH;
-unsigned long openCandidateTime = 0;
+int buttonStableState =
+  HIGH;
 
-int closeStableState = HIGH;
-int closeCandidateState = HIGH;
-unsigned long closeCandidateTime = 0;
+int buttonCandidateState =
+  HIGH;
+
+unsigned long buttonCandidateTime =
+  0;
 
 /* =========================================================
-   BASES DE DONNEES
+   BASES DONNEES
    ========================================================= */
 #define MAX_RFID_USERS 50
 #define MAX_FINGER_USERS 50
 
 struct RfidUser {
+
   char uid[24];
   char name[32];
+
   bool enabled;
+
   unsigned long allowedFrom;
   unsigned long allowedTo;
+
   int maxUses;
   int usedCount;
+
   char allowedDoors[120];
+
   bool used;
 };
 
 struct FingerUser {
+
   int id;
+
   char name[32];
+
   bool enabled;
+
   unsigned long allowedFrom;
   unsigned long allowedTo;
+
   int maxUses;
   int usedCount;
+
   char allowedDoors[120];
+
   bool used;
 };
 
-RfidUser rfidDb[MAX_RFID_USERS];
-FingerUser fingerDb[MAX_FINGER_USERS];
+RfidUser rfidDb[
+  MAX_RFID_USERS
+];
+
+FingerUser fingerDb[
+  MAX_FINGER_USERS
+];
 
 /* =========================================================
-   CARTE SD
+   INITIALISATION MCP23017
    ========================================================= */
-void logSD(const String& text) {
-  if (!sdReady) return;
+bool initMcp23017() {
 
-  File f = SD.open(LOG_FILE, FILE_APPEND);
+  Serial.println(
+    "Initialisation I2C..."
+  );
 
-  if (!f) {
-    Serial.println("Erreur ouverture log.txt");
+  Wire.begin(
+    I2C_SDA,
+    I2C_SCL
+  );
+
+  delay(50);
+
+  if (
+    !mcp.begin_I2C(
+      MCP_ADDRESS
+    )
+  ) {
+
+    mcpReady =
+      false;
+
+    Serial.println(
+      "ERREUR MCP23017"
+    );
+
+    return false;
+  }
+
+  mcpReady =
+    true;
+
+  Serial.println(
+    "MCP23017 OK adresse 0x20"
+  );
+
+  mcp.pinMode(
+    MCP_LED_GREEN,
+    OUTPUT
+  );
+
+  mcp.pinMode(
+    MCP_LED_RED,
+    OUTPUT
+  );
+
+  mcp.pinMode(
+    MCP_BUTTON,
+    INPUT_PULLUP
+  );
+
+  mcp.digitalWrite(
+    MCP_LED_GREEN,
+    LOW
+  );
+
+  mcp.digitalWrite(
+    MCP_LED_RED,
+    LOW
+  );
+
+  buttonStableState =
+    mcp.digitalRead(
+      MCP_BUTTON
+    );
+
+  buttonCandidateState =
+    buttonStableState;
+
+  buttonCandidateTime =
+    millis();
+
+  return true;
+}
+
+/* =========================================================
+   INITIALISATION AUDIO MAX98357A
+   ========================================================= */
+bool initAudio() {
+
+  Serial.println(
+    "Initialisation MAX98357A..."
+  );
+
+  /*
+     Ordre :
+     BCLK
+     WS/LRC
+     DATA OUT
+     DATA IN
+     MCLK
+  */
+  I2S.setPins(
+    I2S_BCLK,
+    I2S_LRC,
+    I2S_DOUT,
+    -1,
+    -1
+  );
+
+  if (
+    !I2S.begin(
+      I2S_MODE_STD,
+      AUDIO_SAMPLE_RATE,
+      I2S_DATA_BIT_WIDTH_16BIT,
+      I2S_SLOT_MODE_MONO
+    )
+  ) {
+
+    audioReady =
+      false;
+
+    Serial.println(
+      "ERREUR MAX98357A / I2S"
+    );
+
+    return false;
+  }
+
+  audioReady =
+    true;
+
+  Serial.println(
+    "MAX98357A AUDIO OK"
+  );
+
+  return true;
+}
+
+/* =========================================================
+   LECTURE D'UN WAV DEPUIS SD
+   ========================================================= */
+
+/*
+   Pour ce projet les fichiers doivent être :
+
+   WAV
+   PCM
+   16 bits
+   mono
+   16000 Hz
+
+   avec un header WAV standard de 44 octets.
+*/
+void playAudioFile(
+  const char* path
+) {
+
+  if (!audioReady) {
+
+    Serial.println(
+      "Audio indisponible"
+    );
+
     return;
   }
 
-  f.print(millis());
-  f.print(" | ");
-  f.println(text);
-  f.close();
+  if (!sdReady) {
+
+    Serial.println(
+      "Lecture audio impossible : SD absente"
+    );
+
+    return;
+  }
+
+  File audioFile =
+    SD.open(
+      path,
+      FILE_READ
+    );
+
+  if (!audioFile) {
+
+    Serial.print(
+      "Fichier audio absent : "
+    );
+
+    Serial.println(
+      path
+    );
+
+    return;
+  }
+
+  Serial.print(
+    "Lecture audio : "
+  );
+
+  Serial.println(
+    path
+  );
+
+  /*
+     Vérification taille minimale.
+  */
+  if (
+    audioFile.size() <=
+    44
+  ) {
+
+    Serial.println(
+      "Fichier WAV invalide"
+    );
+
+    audioFile.close();
+
+    return;
+  }
+
+  /*
+     Saut du header WAV standard.
+  */
+  audioFile.seek(
+    44
+  );
+
+  uint8_t buffer[512];
+
+  while (
+    audioFile.available()
+  ) {
+
+    int bytesRead =
+      audioFile.read(
+        buffer,
+        sizeof(buffer)
+      );
+
+    if (
+      bytesRead <=
+      0
+    ) {
+      break;
+    }
+
+    I2S.write(
+      buffer,
+      bytesRead
+    );
+
+    /*
+       Maintient MQTT vivant pendant
+       une annonce vocale.
+    */
+    if (
+      client.connected()
+    ) {
+
+      client.loop();
+    }
+
+    yield();
+  }
+
+  audioFile.close();
+
+  /*
+     Quelques données nulles pour
+     nettoyer la fin de lecture.
+  */
+  int16_t silence[128] =
+    {0};
+
+  I2S.write(
+    (uint8_t*)silence,
+    sizeof(silence)
+  );
+
+  Serial.println(
+    "Audio termine"
+  );
+}
+
+/* =========================================================
+   BIPS SUR LE HAUT-PARLEUR
+   ========================================================= */
+
+/*
+   On conserve les anciennes fonctions beepShort()
+   et beepDouble(), donc aucune fonctionnalité du
+   programme n'est supprimée.
+
+   Le buzzer physique est simplement remplacé
+   par le MAX98357A.
+*/
+void playTone(
+  int frequency,
+  int durationMs
+) {
+
+  if (!audioReady) {
+    return;
+  }
+
+  int totalSamples =
+    (
+      AUDIO_SAMPLE_RATE *
+      durationMs
+    ) /
+    1000;
+
+  int16_t samples[128];
+
+  float phase =
+    0.0;
+
+  float phaseStep =
+    (
+      2.0 *
+      PI *
+      frequency
+    ) /
+    AUDIO_SAMPLE_RATE;
+
+  int generated =
+    0;
+
+  while (
+    generated <
+    totalSamples
+  ) {
+
+    int count =
+      totalSamples -
+      generated;
+
+    if (
+      count >
+      128
+    ) {
+      count =
+        128;
+    }
+
+    for (
+      int i = 0;
+      i < count;
+      i++
+    ) {
+
+      samples[i] =
+        (int16_t)(
+          sin(phase) *
+          7000
+        );
+
+      phase +=
+        phaseStep;
+
+      if (
+        phase >
+        2.0 * PI
+      ) {
+
+        phase -=
+          2.0 * PI;
+      }
+    }
+
+    I2S.write(
+      (uint8_t*)samples,
+      count *
+        sizeof(int16_t)
+    );
+
+    generated +=
+      count;
+  }
+
+  int16_t silence[128] =
+    {0};
+
+  I2S.write(
+    (uint8_t*)silence,
+    sizeof(silence)
+  );
+}
+
+void beepShort() {
+
+  playTone(
+    1100,
+    100
+  );
+}
+
+void beepDouble() {
+
+  playTone(
+    700,
+    90
+  );
+
+  delay(80);
+
+  playTone(
+    700,
+    90
+  );
+}
+
+/* =========================================================
+   OUTILS SD
+   ========================================================= */
+void logSD(
+  const String& text
+) {
+
+  if (!sdReady) {
+    return;
+  }
+
+  File file =
+    SD.open(
+      LOG_FILE,
+      FILE_APPEND
+    );
+
+  if (!file) {
+
+    Serial.println(
+      "Erreur ouverture log.txt"
+    );
+
+    return;
+  }
+
+  file.print(
+    millis()
+  );
+
+  file.print(
+    " | "
+  );
+
+  file.println(
+    text
+  );
+
+  file.close();
+}
+
+bool writeFileSD(
+  const char* path,
+  const String& data
+) {
+
+  if (!sdReady) {
+    return false;
+  }
+
+  if (
+    SD.exists(path)
+  ) {
+
+    SD.remove(path);
+  }
+
+  File file =
+    SD.open(
+      path,
+      FILE_WRITE
+    );
+
+  if (!file) {
+
+    Serial.println(
+      "Erreur ecriture SD : " +
+      String(path)
+    );
+
+    return false;
+  }
+
+  file.print(
+    data
+  );
+
+  file.close();
+
+  Serial.println(
+    "Fichier sauvegarde : " +
+    String(path)
+  );
+
+  return true;
+}
+
+String readFileSD(
+  const char* path
+) {
+
+  if (!sdReady) {
+    return "";
+  }
+
+  File file =
+    SD.open(
+      path,
+      FILE_READ
+    );
+
+  if (!file) {
+
+    Serial.println(
+      "Fichier absent : " +
+      String(path)
+    );
+
+    return "";
+  }
+
+  String data =
+    file.readString();
+
+  file.close();
+
+  return data;
+}
+
+/* =========================================================
+   DATE ET HEURE
+   ========================================================= */
+bool timeIsValid() {
+
+  time_t now;
+
+  time(
+    &now
+  );
+
+  return
+    now >
+    1700000000;
 }
 
 String getDateTimeString() {
+
   struct tm timeInfo;
 
-  if (!getLocalTime(&timeInfo, 100)) {
-    return "NON_SYNCHRONISE_" + String(millis());
+  if (
+    !getLocalTime(
+      &timeInfo,
+      20
+    )
+  ) {
+
+    return "";
   }
 
   char buffer[25];
@@ -254,158 +937,847 @@ String getDateTimeString() {
     &timeInfo
   );
 
-  return String(buffer);
+  return
+    String(buffer);
 }
 
-String csvSafe(String value) {
-  value.replace(";", ",");
-  value.replace("\r", " ");
-  value.replace("\n", " ");
+void getDateAndTime(
+  String& dateText,
+  String& timeText
+) {
+
+  struct tm timeInfo;
+
+  dateText =
+    "";
+
+  timeText =
+    "";
+
+  if (
+    !getLocalTime(
+      &timeInfo,
+      20
+    )
+  ) {
+
+    return;
+  }
+
+  char dateBuffer[15];
+  char timeBuffer[15];
+
+  strftime(
+    dateBuffer,
+    sizeof(dateBuffer),
+    "%d/%m/%Y",
+    &timeInfo
+  );
+
+  strftime(
+    timeBuffer,
+    sizeof(timeBuffer),
+    "%H:%M:%S",
+    &timeInfo
+  );
+
+  dateText =
+    String(dateBuffer);
+
+  timeText =
+    String(timeBuffer);
+}
+
+String csvSafe(
+  String value
+) {
+
+  value.replace(
+    ";",
+    ","
+  );
+
+  value.replace(
+    "\r",
+    " "
+  );
+
+  value.replace(
+    "\n",
+    " "
+  );
+
   return value;
 }
 
+/* =========================================================
+   HISTORIQUE CSV
+   ========================================================= */
 void logAccessHistory(
   const String& direction,
   const String& method,
   const String& identifier,
   const String& personName,
-  const String& result = "AUTHORIZED"
+  const String& result,
+  const String& dateText,
+  const String& timeText
 ) {
+
   if (!sdReady) {
-    Serial.println("Historique non enregistre : SD absente");
+
+    Serial.println(
+      "Historique non enregistre : SD absente"
+    );
+
     return;
   }
 
-  bool newFile = !SD.exists(ACCESS_HISTORY_FILE);
+  bool newFile =
+    !SD.exists(
+      ACCESS_HISTORY_FILE
+    );
 
-  File f = SD.open(ACCESS_HISTORY_FILE, FILE_APPEND);
+  File file =
+    SD.open(
+      ACCESS_HISTORY_FILE,
+      FILE_APPEND
+    );
 
-  if (!f) {
-    Serial.println("Erreur ouverture access_history.csv");
+  if (!file) {
+
+    Serial.println(
+      "Erreur ouverture access_history.csv"
+    );
+
     return;
   }
 
   if (newFile) {
-    f.println("Nom;Date;Heure;Direction;Methode;Identifiant;Resultat");
+
+    file.println(
+      "Nom;Date;Heure;Direction;Methode;Identifiant;Resultat"
+    );
   }
 
-  struct tm timeInfo;
+  file.print(
+    csvSafe(
+      personName
+    )
+  );
 
-  String dateText = "DATE_INCONNUE";
-  String heureText = "HEURE_INCONNUE";
+  file.print(";");
 
-  if (getLocalTime(&timeInfo, 100)) {
-    char dateBuffer[15];
-    char heureBuffer[15];
+  file.print(
+    dateText.length() > 0
+      ? csvSafe(dateText)
+      : "A_SYNCHRONISER"
+  );
 
-    strftime(
-      dateBuffer,
-      sizeof(dateBuffer),
-      "%d/%m/%Y",
-      &timeInfo
-    );
+  file.print(";");
 
-    strftime(
-      heureBuffer,
-      sizeof(heureBuffer),
-      "%H:%M:%S",
-      &timeInfo
-    );
+  file.print(
+    timeText.length() > 0
+      ? csvSafe(timeText)
+      : "A_SYNCHRONISER"
+  );
 
-    dateText = String(dateBuffer);
-    heureText = String(heureBuffer);
-  }
+  file.print(";");
 
-  String safeName = personName;
-  safeName.replace(";", ",");
+  file.print(
+    csvSafe(direction)
+  );
 
-  f.print(safeName);
-  f.print(";");
+  file.print(";");
 
-  f.print(dateText);
-  f.print(";");
+  file.print(
+    csvSafe(method)
+  );
 
-  f.print(heureText);
-  f.print(";");
+  file.print(";");
 
-  f.print(direction);
-  f.print(";");
+  file.print(
+    csvSafe(identifier)
+  );
 
-  f.print(method);
-  f.print(";");
+  file.print(";");
 
-  f.print(identifier);
-  f.print(";");
+  file.println(
+    csvSafe(result)
+  );
 
-  f.println(result);
-
-  f.close();
+  file.close();
 
   Serial.println(
-    safeName +
+    personName +
     " | " +
-    dateText +
+    (
+      dateText.length() >
+      0
+        ? dateText
+        : "A_SYNCHRONISER"
+    ) +
     " | " +
-    heureText +
+    (
+      timeText.length() >
+      0
+        ? timeText
+        : "A_SYNCHRONISER"
+    ) +
     " | " +
     direction
   );
 }
 
-bool writeFileSD(const char* path, const String& data) {
-  if (!sdReady) return false;
+/* =========================================================
+   IDENTIFIANT UNIQUE
+   ========================================================= */
+String createEventId() {
 
-  if (SD.exists(path)) {
-    SD.remove(path);
-  }
+  unsigned long sequence =
+    prefs.getULong(
+      "eventSeq",
+      0
+    );
 
-  File f = SD.open(path, FILE_WRITE);
+  sequence++;
 
-  if (!f) {
-    Serial.println("Erreur ecriture SD : " + String(path));
+  prefs.putULong(
+    "eventSeq",
+    sequence
+  );
+
+  return
+    deviceId +
+    "-" +
+    String(sequence);
+}
+
+/* =========================================================
+   FILE HORS LIGNE
+   ========================================================= */
+bool appendPendingEvent(
+  const String& jsonLine
+) {
+
+  if (!sdReady) {
+
+    Serial.println(
+      "Impossible d'ajouter l'evenement : SD absente"
+    );
+
     return false;
   }
 
-  f.print(data);
-  f.close();
+  File file =
+    SD.open(
+      PENDING_EVENTS_FILE,
+      FILE_APPEND
+    );
 
-  Serial.println("Fichier sauvegarde : " + String(path));
+  if (!file) {
+
+    Serial.println(
+      "Erreur ouverture pending_events.ndjson"
+    );
+
+    return false;
+  }
+
+  file.println(
+    jsonLine
+  );
+
+  file.close();
+
+  Serial.println(
+    "Evenement ajoute a la file hors ligne"
+  );
+
   return true;
 }
 
-String readFileSD(const char* path) {
-  if (!sdReady) return "";
+/* =========================================================
+   ENREGISTREMENT EVENEMENT
+   ========================================================= */
+String recordAccessEvent(
+  const String& direction,
+  const String& method,
+  const String& identifier,
+  const String& personName,
+  const String& result =
+    "AUTHORIZED"
+) {
 
-  File f = SD.open(path, FILE_READ);
+  String dateText;
+  String timeText;
 
-  if (!f) {
-    Serial.println("Fichier absent : " + String(path));
-    return "";
-  }
+  getDateAndTime(
+    dateText,
+    timeText
+  );
 
-  String data = f.readString();
-  f.close();
+  logAccessHistory(
+    direction,
+    method,
+    identifier,
+    personName,
+    result,
+    dateText,
+    timeText
+  );
 
-  return data;
+  String eventId =
+    createEventId();
+
+  StaticJsonDocument<1024>
+    document;
+
+  document["eventId"] =
+    eventId;
+
+  document["deviceId"] =
+    deviceId;
+
+  document["door"] =
+    doorId;
+
+  document["direction"] =
+    direction;
+
+  document["method"] =
+    method;
+
+  document["identifier"] =
+    identifier;
+
+  document["name"] =
+    personName;
+
+  document["result"] =
+    result;
+
+  document["date"] =
+    dateText.length() > 0
+      ? dateText
+      : "";
+
+  document["time"] =
+    timeText.length() > 0
+      ? timeText
+      : "";
+
+  document["dateTime"] =
+    getDateTimeString();
+
+  document["millisAtEvent"] =
+    millis();
+
+  document["timeSynced"] =
+    timeIsValid();
+
+  String jsonLine;
+
+  serializeJson(
+    document,
+    jsonLine
+  );
+
+  appendPendingEvent(
+    jsonLine
+  );
+
+  lastSyncCheck =
+    0;
+
+  return eventId;
 }
 
+/* =========================================================
+   LECTURE PREMIER EVENEMENT
+   ========================================================= */
+bool readFirstPendingEvent(
+  String& jsonLine,
+  String& eventId
+) {
+
+  jsonLine =
+    "";
+
+  eventId =
+    "";
+
+  if (!sdReady) {
+    return false;
+  }
+
+  if (
+    !SD.exists(
+      PENDING_EVENTS_FILE
+    )
+  ) {
+
+    return false;
+  }
+
+  File file =
+    SD.open(
+      PENDING_EVENTS_FILE,
+      FILE_READ
+    );
+
+  if (!file) {
+    return false;
+  }
+
+  while (
+    file.available()
+  ) {
+
+    String line =
+      file.readStringUntil(
+        '\n'
+      );
+
+    line.trim();
+
+    if (
+      line.length() ==
+      0
+    ) {
+
+      continue;
+    }
+
+    StaticJsonDocument<1024>
+      document;
+
+    DeserializationError error =
+      deserializeJson(
+        document,
+        line
+      );
+
+    if (error) {
+
+      Serial.println(
+        "Ligne NDJSON invalide ignoree"
+      );
+
+      continue;
+    }
+
+    String id =
+      document[
+        "eventId"
+      ] | "";
+
+    if (
+      id.length() ==
+      0
+    ) {
+
+      continue;
+    }
+
+    jsonLine =
+      line;
+
+    eventId =
+      id;
+
+    file.close();
+
+    return true;
+  }
+
+  file.close();
+
+  return false;
+}
+
+/* =========================================================
+   SUPPRESSION APRES ACK
+   ========================================================= */
+bool removePendingEvent(
+  const String& acknowledgedEventId
+) {
+
+  if (!sdReady) {
+    return false;
+  }
+
+  if (
+    !SD.exists(
+      PENDING_EVENTS_FILE
+    )
+  ) {
+
+    return true;
+  }
+
+  File source =
+    SD.open(
+      PENDING_EVENTS_FILE,
+      FILE_READ
+    );
+
+  if (!source) {
+    return false;
+  }
+
+  if (
+    SD.exists(
+      PENDING_TEMP_FILE
+    )
+  ) {
+
+    SD.remove(
+      PENDING_TEMP_FILE
+    );
+  }
+
+  File temp =
+    SD.open(
+      PENDING_TEMP_FILE,
+      FILE_WRITE
+    );
+
+  if (!temp) {
+
+    source.close();
+
+    return false;
+  }
+
+  bool removed =
+    false;
+
+  while (
+    source.available()
+  ) {
+
+    String line =
+      source.readStringUntil(
+        '\n'
+      );
+
+    line.trim();
+
+    if (
+      line.length() ==
+      0
+    ) {
+
+      continue;
+    }
+
+    StaticJsonDocument<1024>
+      document;
+
+    DeserializationError error =
+      deserializeJson(
+        document,
+        line
+      );
+
+    if (error) {
+
+      temp.println(
+        line
+      );
+
+      continue;
+    }
+
+    String currentEventId =
+      document[
+        "eventId"
+      ] | "";
+
+    if (
+      !removed &&
+      currentEventId ==
+        acknowledgedEventId
+    ) {
+
+      removed =
+        true;
+
+      continue;
+    }
+
+    temp.println(
+      line
+    );
+  }
+
+  source.close();
+  temp.close();
+
+  SD.remove(
+    PENDING_EVENTS_FILE
+  );
+
+  if (
+    !SD.rename(
+      PENDING_TEMP_FILE,
+      PENDING_EVENTS_FILE
+    )
+  ) {
+
+    Serial.println(
+      "Erreur remplacement pending_events.ndjson"
+    );
+
+    return false;
+  }
+
+  if (removed) {
+
+    Serial.println(
+      "ACK recu, evenement supprime : " +
+      acknowledgedEventId
+    );
+  }
+
+  return removed;
+}
+
+/* =========================================================
+   SYNCHRONISATION MQTT
+   ========================================================= */
+void processPendingEvents() {
+
+  if (!sdReady) {
+    return;
+  }
+
+  if (
+    !client.connected()
+  ) {
+    return;
+  }
+
+  unsigned long now =
+    millis();
+
+  if (
+    now -
+      lastSyncCheck <
+    SYNC_CHECK_TIME
+  ) {
+
+    return;
+  }
+
+  lastSyncCheck =
+    now;
+
+  if (
+    waitingAccessAck
+  ) {
+
+    if (
+      now -
+        lastSyncPublish >=
+      SYNC_RETRY_TIME
+    ) {
+
+      bool published =
+        client.publish(
+          topic(
+            "access_sync"
+          ).c_str(),
+          waitingEventJson.c_str(),
+          false
+        );
+
+      if (published) {
+
+        lastSyncPublish =
+          now;
+
+        Serial.println(
+          "Nouvelle tentative sync : " +
+          waitingEventId
+        );
+      }
+    }
+
+    return;
+  }
+
+  String jsonLine;
+  String eventId;
+
+  if (
+    !readFirstPendingEvent(
+      jsonLine,
+      eventId
+    )
+  ) {
+
+    return;
+  }
+
+  bool published =
+    client.publish(
+      topic(
+        "access_sync"
+      ).c_str(),
+      jsonLine.c_str(),
+      false
+    );
+
+  if (!published) {
+
+    Serial.println(
+      "Echec publication evenement en attente"
+    );
+
+    return;
+  }
+
+  waitingAccessAck =
+    true;
+
+  waitingEventId =
+    eventId;
+
+  waitingEventJson =
+    jsonLine;
+
+  lastSyncPublish =
+    now;
+
+  Serial.println(
+    "Evenement envoye, attente ACK : " +
+    eventId
+  );
+}
+
+/* =========================================================
+   ACK NODE-RED
+   ========================================================= */
+void handleAccessAck(
+  const String& message
+) {
+
+  String acknowledgedId =
+    message;
+
+  if (
+    message.startsWith(
+      "{"
+    )
+  ) {
+
+    StaticJsonDocument<256>
+      document;
+
+    DeserializationError error =
+      deserializeJson(
+        document,
+        message
+      );
+
+    if (!error) {
+
+      acknowledgedId =
+        document[
+          "eventId"
+        ] | "";
+    }
+  }
+
+  acknowledgedId.trim();
+
+  if (
+    acknowledgedId.length() ==
+    0
+  ) {
+
+    return;
+  }
+
+  if (
+    !waitingAccessAck ||
+    acknowledgedId !=
+      waitingEventId
+  ) {
+
+    removePendingEvent(
+      acknowledgedId
+    );
+
+    return;
+  }
+
+  if (
+    removePendingEvent(
+      acknowledgedId
+    )
+  ) {
+
+    waitingAccessAck =
+      false;
+
+    waitingEventId =
+      "";
+
+    waitingEventJson =
+      "";
+
+    lastSyncPublish =
+      0;
+
+    lastSyncCheck =
+      0;
+  }
+}
+
+/* =========================================================
+   CONFIGURATION SD
+   ========================================================= */
 void saveConfigToSD() {
-  if (!sdReady) return;
 
-  StaticJsonDocument<512> doc;
+  if (!sdReady) {
+    return;
+  }
 
-  doc["deviceId"] = deviceId;
-  doc["doorId"] = doorId;
+  StaticJsonDocument<512>
+    document;
 
-  String out;
-  serializeJson(doc, out);
+  document["deviceId"] =
+    deviceId;
 
-  writeFileSD(CONFIG_FILE, out);
+  document["doorId"] =
+    doorId;
+
+  String output;
+
+  serializeJson(
+    document,
+    output
+  );
+
+  writeFileSD(
+    CONFIG_FILE,
+    output
+  );
 }
 
 void initSD() {
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
+
+  pinMode(
+    SD_CS,
+    OUTPUT
+  );
+
+  digitalWrite(
+    SD_CS,
+    HIGH
+  );
 
   spiSD.begin(
     SD_SCK,
@@ -416,195 +1788,417 @@ void initSD() {
 
   delay(100);
 
-  if (!SD.begin(SD_CS, spiSD, 4000000)) {
-    sdReady = false;
-    Serial.println("SD ERROR sur SPI separe");
+  if (
+    !SD.begin(
+      SD_CS,
+      spiSD,
+      4000000
+    )
+  ) {
+
+    sdReady =
+      false;
+
+    Serial.println(
+      "SD ERROR sur SPI separe"
+    );
+
     return;
   }
 
-  uint8_t cardType = SD.cardType();
+  uint8_t cardType =
+    SD.cardType();
 
-  if (cardType == CARD_NONE) {
-    sdReady = false;
-    Serial.println("Aucune carte SD detectee");
+  if (
+    cardType ==
+    CARD_NONE
+  ) {
+
+    sdReady =
+      false;
+
+    Serial.println(
+      "Aucune carte SD detectee"
+    );
+
     return;
   }
 
-  sdReady = true;
+  sdReady =
+    true;
 
-  Serial.println("SD OK sur SPI separe");
+  Serial.println(
+    "SD OK sur SPI separe"
+  );
 
-  Serial.print("Type carte SD : ");
+  Serial.print(
+    "Type carte SD : "
+  );
 
-  if (cardType == CARD_MMC) {
-    Serial.println("MMC");
+  if (
+    cardType ==
+    CARD_MMC
+  ) {
+
+    Serial.println(
+      "MMC"
+    );
   }
-  else if (cardType == CARD_SD) {
-    Serial.println("SDSC");
+
+  else if (
+    cardType ==
+    CARD_SD
+  ) {
+
+    Serial.println(
+      "SDSC"
+    );
   }
-  else if (cardType == CARD_SDHC) {
-    Serial.println("SDHC");
+
+  else if (
+    cardType ==
+    CARD_SDHC
+  ) {
+
+    Serial.println(
+      "SDHC"
+    );
   }
+
   else {
-    Serial.println("INCONNU");
+
+    Serial.println(
+      "INCONNU"
+    );
   }
 
   uint64_t cardSizeMB =
-    SD.cardSize() / (1024ULL * 1024ULL);
+    SD.cardSize() /
+    (
+      1024ULL *
+      1024ULL
+    );
 
-  Serial.print("Taille carte : ");
-  Serial.print(cardSizeMB);
-  Serial.println(" MB");
+  Serial.print(
+    "Taille carte : "
+  );
 
-  File f = SD.open(LOG_FILE, FILE_APPEND);
+  Serial.print(
+    cardSizeMB
+  );
 
-  if (f) {
-    f.println("===== ESP START =====");
-    f.println("Device ID: " + deviceId);
-    f.println("Door ID: " + doorId);
-    f.println("Date: " + getDateTimeString());
-    f.close();
+  Serial.println(
+    " MB"
+  );
+
+  File file =
+    SD.open(
+      LOG_FILE,
+      FILE_APPEND
+    );
+
+  if (file) {
+
+    file.println(
+      "===== ESP START ====="
+    );
+
+    file.println(
+      "Device ID: " +
+      deviceId
+    );
+
+    file.println(
+      "Door ID: " +
+      doorId
+    );
+
+    file.close();
   }
 
   saveConfigToSD();
 }
 
 /* =========================================================
-   MQTT
+   MQTT PUBLICATION
    ========================================================= */
 void publishMsg(
-  const String& t,
-  const String& msg,
-  bool retained = false
+  const String& mqttTopic,
+  const String& message,
+  bool retained =
+    false
 ) {
-  if (client.connected()) {
-    client.publish(
-      t.c_str(),
-      msg.c_str(),
-      retained
-    );
-  }
-}
 
-String stateToString() {
-  switch (state) {
-    case READY: return "READY";
-    case OPEN: return "OPEN";
-    case WAIT: return "WAIT";
-    case REFUSED: return "REFUSED";
-    default: return "UNKNOWN";
-  }
-}
+  if (
+    !client.connected()
+  ) {
 
-/* =========================================================
-   LEDS / BUZZER
-   ========================================================= */
-void updateLeds() {
-  bool networkOk =
-    WiFi.status() == WL_CONNECTED &&
-    client.connected();
-
-  digitalWrite(
-    LED_STATUS,
-    networkOk ? HIGH : LOW
-  );
-
-  if (relationLocked) {
-    digitalWrite(LED_GREEN, LOW);
-    digitalWrite(LED_RED, HIGH);
     return;
   }
 
-  if (state == READY || state == OPEN) {
-    digitalWrite(LED_GREEN, HIGH);
-    digitalWrite(LED_RED, LOW);
-  }
-  else {
-    digitalWrite(LED_GREEN, LOW);
-    digitalWrite(LED_RED, HIGH);
-  }
+  client.publish(
+    mqttTopic.c_str(),
+    message.c_str(),
+    retained
+  );
 }
 
-void beepShort() {
-  digitalWrite(BUZZER, HIGH);
-  delay(100);
-  digitalWrite(BUZZER, LOW);
-}
+String stateToString() {
 
-void beepDouble() {
-  digitalWrite(BUZZER, HIGH);
-  delay(80);
+  switch (state) {
 
-  digitalWrite(BUZZER, LOW);
-  delay(80);
+    case READY:
+      return "READY";
 
-  digitalWrite(BUZZER, HIGH);
-  delay(80);
+    case OPEN:
+      return "OPEN";
 
-  digitalWrite(BUZZER, LOW);
+    case WAIT:
+      return "WAIT";
+
+    case REFUSED:
+      return "REFUSED";
+
+    default:
+      return "UNKNOWN";
+  }
 }
 
 /* =========================================================
-   INITIALISATION BASES
+   LEDS MCP23017 - VERSION CORRIGEE
+   ========================================================= */
+void updateLeds() {
+
+  if (!mcpReady) {
+
+    Serial.println(
+      "LED ERROR : MCP23017 indisponible"
+    );
+
+    return;
+  }
+
+  /*
+     On commence par éteindre
+     les deux LED.
+  */
+  mcp.digitalWrite(
+    MCP_LED_GREEN,
+    LOW
+  );
+
+  mcp.digitalWrite(
+    MCP_LED_RED,
+    LOW
+  );
+
+  /*
+     Verrouillage ou accès refusé :
+     LED rouge.
+  */
+  if (
+    relationLocked ||
+    state ==
+      REFUSED
+  ) {
+
+    mcp.digitalWrite(
+      MCP_LED_RED,
+      HIGH
+    );
+
+    return;
+  }
+
+  /*
+     READY / OPEN :
+     LED verte.
+  */
+  if (
+    state ==
+      READY ||
+    state ==
+      OPEN
+  ) {
+
+    mcp.digitalWrite(
+      MCP_LED_GREEN,
+      HIGH
+    );
+
+    return;
+  }
+
+  /*
+     WAIT :
+     LED rouge.
+  */
+  if (
+    state ==
+    WAIT
+  ) {
+
+    mcp.digitalWrite(
+      MCP_LED_RED,
+      HIGH
+    );
+
+    return;
+  }
+}
+
+/* =========================================================
+   BASES
    ========================================================= */
 void clearRfidDb() {
-  for (int i = 0; i < MAX_RFID_USERS; i++) {
-    rfidDb[i].uid[0] = '\0';
-    rfidDb[i].name[0] = '\0';
-    rfidDb[i].allowedDoors[0] = '\0';
-    rfidDb[i].enabled = false;
-    rfidDb[i].allowedFrom = 0;
-    rfidDb[i].allowedTo = 0;
-    rfidDb[i].maxUses = 0;
-    rfidDb[i].usedCount = 0;
-    rfidDb[i].used = false;
+
+  for (
+    int i = 0;
+    i < MAX_RFID_USERS;
+    i++
+  ) {
+
+    rfidDb[i].uid[0] =
+      '\0';
+
+    rfidDb[i].name[0] =
+      '\0';
+
+    rfidDb[i]
+      .allowedDoors[0] =
+      '\0';
+
+    rfidDb[i].enabled =
+      false;
+
+    rfidDb[i].allowedFrom =
+      0;
+
+    rfidDb[i].allowedTo =
+      0;
+
+    rfidDb[i].maxUses =
+      0;
+
+    rfidDb[i].usedCount =
+      0;
+
+    rfidDb[i].used =
+      false;
   }
 }
 
 void clearFingerDb() {
-  for (int i = 0; i < MAX_FINGER_USERS; i++) {
-    fingerDb[i].id = -1;
-    fingerDb[i].name[0] = '\0';
-    fingerDb[i].allowedDoors[0] = '\0';
-    fingerDb[i].enabled = false;
-    fingerDb[i].allowedFrom = 0;
-    fingerDb[i].allowedTo = 0;
-    fingerDb[i].maxUses = 0;
-    fingerDb[i].usedCount = 0;
-    fingerDb[i].used = false;
+
+  for (
+    int i = 0;
+    i < MAX_FINGER_USERS;
+    i++
+  ) {
+
+    fingerDb[i].id =
+      -1;
+
+    fingerDb[i].name[0] =
+      '\0';
+
+    fingerDb[i]
+      .allowedDoors[0] =
+      '\0';
+
+    fingerDb[i].enabled =
+      false;
+
+    fingerDb[i].allowedFrom =
+      0;
+
+    fingerDb[i].allowedTo =
+      0;
+
+    fingerDb[i].maxUses =
+      0;
+
+    fingerDb[i].usedCount =
+      0;
+
+    fingerDb[i].used =
+      false;
   }
 }
 
-String normalizeUid(String uid) {
+String normalizeUid(
+  String uid
+) {
+
   uid.trim();
   uid.toUpperCase();
 
-  String out = "";
+  String output =
+    "";
 
-  for (int i = 0; i < uid.length(); i++) {
-    char c = uid[i];
+  for (
+    int i = 0;
+    i < uid.length();
+    i++
+  ) {
+
+    char character =
+      uid[i];
 
     if (
-      (c >= '0' && c <= '9') ||
-      (c >= 'A' && c <= 'F')
+      (
+        character >=
+          '0' &&
+        character <=
+          '9'
+      ) ||
+      (
+        character >=
+          'A' &&
+        character <=
+          'F'
+      )
     ) {
-      out += c;
+
+      output +=
+        character;
     }
   }
 
-  return out;
+  return output;
 }
 
-int findRfid(const String& uid) {
-  String normalized = normalizeUid(uid);
+int findRfid(
+  const String& uid
+) {
 
-  for (int i = 0; i < MAX_RFID_USERS; i++) {
-    if (!rfidDb[i].used) continue;
+  String normalized =
+    normalizeUid(
+      uid
+    );
+
+  for (
+    int i = 0;
+    i < MAX_RFID_USERS;
+    i++
+  ) {
 
     if (
-      normalizeUid(String(rfidDb[i].uid)) ==
+      !rfidDb[i].used
+    ) {
+
+      continue;
+    }
+
+    if (
+      normalizeUid(
+        String(
+          rfidDb[i].uid
+        )
+      ) ==
       normalized
     ) {
+
       return i;
     }
   }
@@ -612,11 +2206,28 @@ int findRfid(const String& uid) {
   return -1;
 }
 
-int findFinger(int id) {
-  for (int i = 0; i < MAX_FINGER_USERS; i++) {
-    if (!fingerDb[i].used) continue;
+int findFinger(
+  int id
+) {
 
-    if (fingerDb[i].id == id) {
+  for (
+    int i = 0;
+    i < MAX_FINGER_USERS;
+    i++
+  ) {
+
+    if (
+      !fingerDb[i].used
+    ) {
+
+      continue;
+    }
+
+    if (
+      fingerDb[i].id ==
+      id
+    ) {
+
       return i;
     }
   }
@@ -625,37 +2236,50 @@ int findFinger(int id) {
 }
 
 /* =========================================================
-   TEMPS
+   CONTROLE DU TEMPS
    ========================================================= */
-bool isTimeSynced() {
-  time_t now;
-  time(&now);
-
-  return now > 1700000000;
-}
-
 unsigned long nowEpoch() {
-  time_t now;
-  time(&now);
 
-  return (unsigned long)now;
+  time_t now;
+
+  time(
+    &now
+  );
+
+  return
+    (unsigned long)now;
 }
 
 bool checkTimeAccess(
-  unsigned long from,
-  unsigned long to
+  unsigned long allowedFrom,
+  unsigned long allowedTo
 ) {
-  if (!isTimeSynced()) {
+
+  if (!timeIsValid()) {
+
     return true;
   }
 
-  unsigned long now = nowEpoch();
+  unsigned long currentTime =
+    nowEpoch();
 
-  if (from > 0 && now < from) {
+  if (
+    allowedFrom >
+      0 &&
+    currentTime <
+      allowedFrom
+  ) {
+
     return false;
   }
 
-  if (to > 0 && now > to) {
+  if (
+    allowedTo >
+      0 &&
+    currentTime >
+      allowedTo
+  ) {
+
     return false;
   }
 
@@ -665,34 +2289,85 @@ bool checkTimeAccess(
 /* =========================================================
    PORTES AUTORISEES
    ========================================================= */
-bool isDoorAllowedForCard(int idx) {
-  String doors =
-    String(rfidDb[idx].allowedDoors);
+bool isDoorAllowedForCard(
+  int index
+) {
 
-  doors.trim();
+  String allowedDoors =
+    String(
+      rfidDb[index]
+        .allowedDoors
+    );
 
-  if (doors.length() == 0) return true;
-  if (doors.indexOf("ALL") >= 0) return true;
+  allowedDoors.trim();
 
-  return doors.indexOf(doorId) >= 0;
+  if (
+    allowedDoors.length() ==
+    0
+  ) {
+
+    return true;
+  }
+
+  if (
+    allowedDoors.indexOf(
+      "ALL"
+    ) >=
+    0
+  ) {
+
+    return true;
+  }
+
+  return
+    allowedDoors.indexOf(
+      doorId
+    ) >=
+    0;
 }
 
-bool isDoorAllowedForFinger(int idx) {
-  String doors =
-    String(fingerDb[idx].allowedDoors);
+bool isDoorAllowedForFinger(
+  int index
+) {
 
-  doors.trim();
+  String allowedDoors =
+    String(
+      fingerDb[index]
+        .allowedDoors
+    );
 
-  if (doors.length() == 0) return true;
-  if (doors.indexOf("ALL") >= 0) return true;
+  allowedDoors.trim();
 
-  return doors.indexOf(doorId) >= 0;
+  if (
+    allowedDoors.length() ==
+    0
+  ) {
+
+    return true;
+  }
+
+  if (
+    allowedDoors.indexOf(
+      "ALL"
+    ) >=
+    0
+  ) {
+
+    return true;
+  }
+
+  return
+    allowedDoors.indexOf(
+      doorId
+    ) >=
+    0;
 }
 
 /* =========================================================
-   PUBLICATION ETAT
+   PUBLICATION ETATS
    ========================================================= */
 void publishAll() {
+
   publishMsg(
     topic("state"),
     stateToString(),
@@ -701,22 +2376,30 @@ void publishAll() {
 
   publishMsg(
     topic("door"),
-    digitalRead(MC38_PIN) == MC38_OPEN
-      ? "OPEN"
-      : "CLOSED",
+    digitalRead(
+      MC38_PIN
+    ) ==
+      MC38_OPEN
+        ? "OPEN"
+        : "CLOSED",
     true
   );
 
   publishMsg(
     topic("pir"),
-    digitalRead(PIR_PIN) == PIR_ACTIVE
-      ? "DETECTED"
-      : "CLEAR",
+    digitalRead(
+      PIR_PIN
+    ) ==
+      PIR_ACTIVE
+        ? "DETECTED"
+        : "CLEAR",
     true
   );
 
   publishMsg(
-    topic("lock_status"),
+    topic(
+      "lock_status"
+    ),
     relationLocked
       ? "LOCKED"
       : "UNLOCKED",
@@ -724,37 +2407,62 @@ void publishAll() {
   );
 
   publishMsg(
-    topic("sd_status"),
-    sdReady ? "OK" : "ERROR",
+    topic(
+      "sd_status"
+    ),
+    sdReady
+      ? "OK"
+      : "ERROR",
     true
   );
 
   publishMsg(
-    "sas/" + deviceId + "/info",
+    "sas/" +
+      deviceId +
+      "/info",
     doorId,
     true
   );
 
   publishMsg(
-    "sas/" + deviceId + "/status",
-    WiFi.status() == WL_CONNECTED
-      ? "online"
-      : "offline",
+    "sas/" +
+      deviceId +
+      "/status",
+    WiFi.status() ==
+      WL_CONNECTED
+        ? "online"
+        : "offline",
     true
   );
 
-  if (!isnan(lastTemp)) {
+  if (
+    !isnan(
+      lastTemp
+    )
+  ) {
+
     publishMsg(
       topic("temp"),
-      String(lastTemp, 1),
+      String(
+        lastTemp,
+        1
+      ),
       true
     );
   }
 
-  if (!isnan(lastHum)) {
+  if (
+    !isnan(
+      lastHum
+    )
+  ) {
+
     publishMsg(
       topic("hum"),
-      String(lastHum, 1),
+      String(
+        lastHum,
+        1
+      ),
       true
     );
   }
@@ -764,32 +2472,84 @@ void publishAll() {
    LOGIQUE PORTE
    ========================================================= */
 bool canOpenDoor() {
-  if (relationLocked) {
+
+  if (
+    relationLocked
+  ) {
+
+    Serial.println(
+      "REFUSED CAUSE : relationLocked = true"
+    );
+
     publishMsg(
       topic("event"),
       "refused_relation_locked"
     );
 
-    return false;
-  }
-
-  if (state != READY) {
-    return false;
-  }
-
-  if (digitalRead(MC38_PIN) == MC38_OPEN) {
-    publishMsg(
-      topic("event"),
-      "refused_door_already_open"
+    logSD(
+      "REFUSED CAUSE: relationLocked"
     );
 
     return false;
   }
 
-  if (otherDoorBusy) {
+  if (
+    state !=
+    READY
+  ) {
+
+    Serial.println(
+      "REFUSED CAUSE : state = " +
+      stateToString()
+    );
+
+    logSD(
+      "REFUSED CAUSE: state=" +
+      stateToString()
+    );
+
+    return false;
+  }
+
+  if (
+    digitalRead(
+      MC38_PIN
+    ) ==
+    MC38_OPEN
+  ) {
+
+    Serial.println(
+      "REFUSED CAUSE : MC38 indique OPEN"
+    );
+
+    publishMsg(
+      topic("event"),
+      "refused_door_already_open"
+    );
+
+    logSD(
+      "REFUSED CAUSE: MC38 OPEN"
+    );
+
+    return false;
+  }
+
+  if (
+    USE_GLOBAL_DOOR_STATE_LOCK &&
+    otherDoorBusy
+  ) {
+
+    Serial.println(
+      "REFUSED CAUSE : otherDoorBusy = true"
+    );
+
     publishMsg(
       topic("event"),
       "refused_other_door_busy"
+    );
+
+    logSD(
+      "REFUSED CAUSE: otherDoorBusy"
     );
 
     return false;
@@ -798,9 +2558,18 @@ bool canOpenDoor() {
   return true;
 }
 
-void setRefused(const String& reason) {
-  state = REFUSED;
-  refusedStart = millis();
+/* =========================================================
+   ACCES REFUSE + ANNONCE
+   ========================================================= */
+void setRefused(
+  const String& reason
+) {
+
+  state =
+    REFUSED;
+
+  refusedStart =
+    millis();
 
   publishMsg(
     topic("state"),
@@ -810,27 +2579,70 @@ void setRefused(const String& reason) {
 
   publishMsg(
     topic("event"),
-    "open_refused_" + reason
+    "open_refused_" +
+      reason
   );
 
-  logSD("REFUSED: " + reason);
+  Serial.println(
+    "PASSAGE REFUSED : " +
+    reason
+  );
+
+  logSD(
+    "REFUSED: " +
+    reason
+  );
 
   updateLeds();
+
+  /*
+     Ancien double bip conservé.
+  */
   beepDouble();
+
+  /*
+     Nouvelle annonce :
+     "Accès refusé"
+  */
+  playAudioFile(
+    AUDIO_ACCESS_DENIED
+  );
 }
 
-bool openDoor(const String& src) {
-  if (!canOpenDoor()) {
-    setRefused(src);
+/* =========================================================
+   OUVERTURE + ANNONCE
+   ========================================================= */
+bool openDoor(
+  const String& source
+) {
+
+  if (
+    !canOpenDoor()
+  ) {
+
+    setRefused(
+      source
+    );
+
     return false;
   }
 
-  doorWasPhysicallyOpen = false;
-  state = OPEN;
-  relayActive = true;
-  relayStart = millis();
+  doorWasPhysicallyOpen =
+    false;
 
-  digitalWrite(RELAY, RELAY_ON);
+  state =
+    OPEN;
+
+  relayActive =
+    true;
+
+  relayStart =
+    millis();
+
+  digitalWrite(
+    RELAY,
+    RELAY_ON
+  );
 
   publishMsg(
     topic("state"),
@@ -840,30 +2652,65 @@ bool openDoor(const String& src) {
 
   publishMsg(
     topic("auth"),
-    src,
+    source,
     true
   );
 
   publishMsg(
     topic("event"),
-    "door_opened_by_" + src
+    "door_opened_by_" +
+      source
   );
 
-  logSD("DOOR OPEN: " + src);
+  Serial.println(
+    "PORTE OUVERTE PAR : " +
+    source
+  );
+
+  logSD(
+    "DOOR OPEN: " +
+    source
+  );
 
   updateLeds();
+
+  /*
+     Ancien bip conservé.
+  */
   beepShort();
+
+  /*
+     Nouvelle annonce :
+     "Porte ouverte"
+  */
+  playAudioFile(
+    AUDIO_DOOR_OPEN
+  );
 
   return true;
 }
 
+/* =========================================================
+   FERMETURE + ANNONCE
+   ========================================================= */
 void startWaitMode() {
-  digitalWrite(RELAY, RELAY_OFF);
 
-  relayActive = false;
-  state = WAIT;
-  waitStart = millis();
-  lastWaitRemain = -2;
+  digitalWrite(
+    RELAY,
+    RELAY_OFF
+  );
+
+  relayActive =
+    false;
+
+  state =
+    WAIT;
+
+  waitStart =
+    millis();
+
+  lastWaitRemain =
+    -2;
 
   publishMsg(
     topic("state"),
@@ -876,19 +2723,44 @@ void startWaitMode() {
     "door_closed_wait"
   );
 
-  logSD("DOOR CLOSED -> WAIT");
+  logSD(
+    "DOOR CLOSED -> WAIT"
+  );
 
   updateLeds();
+
+  /*
+     Ancien double bip conservé.
+  */
   beepDouble();
+
+  /*
+     Nouvelle annonce :
+     "Porte fermée"
+  */
+  playAudioFile(
+    AUDIO_DOOR_CLOSED
+  );
 }
 
 void resetDoor() {
-  digitalWrite(RELAY, RELAY_OFF);
 
-  relayActive = false;
-  doorWasPhysicallyOpen = false;
-  state = READY;
-  lastWaitRemain = -2;
+  digitalWrite(
+    RELAY,
+    RELAY_OFF
+  );
+
+  relayActive =
+    false;
+
+  doorWasPhysicallyOpen =
+    false;
+
+  state =
+    READY;
+
+  lastWaitRemain =
+    -2;
 
   publishMsg(
     topic("state"),
@@ -907,59 +2779,127 @@ void resetDoor() {
     "reset_done"
   );
 
-  logSD("RESET");
+  logSD(
+    "RESET"
+  );
 
   updateLeds();
 }
 
+/* =========================================================
+   MACHINE D'ETAT
+   ========================================================= */
 void handleStateMachine() {
-  unsigned long now = millis();
+
+  unsigned long now =
+    millis();
 
   if (
     relayActive &&
-    now - relayStart >= RELAY_TIME
+    now -
+      relayStart >=
+    RELAY_TIME
   ) {
-    digitalWrite(RELAY, RELAY_OFF);
-    relayActive = false;
+
+    digitalWrite(
+      RELAY,
+      RELAY_OFF
+    );
+
+    relayActive =
+      false;
   }
 
-  if (state == OPEN) {
-    int doorState = digitalRead(MC38_PIN);
+  if (
+    state ==
+    OPEN
+  ) {
 
-    if (doorState == MC38_OPEN) {
-      doorWasPhysicallyOpen = true;
+    int currentDoorState =
+      digitalRead(
+        MC38_PIN
+      );
+
+    if (
+      currentDoorState ==
+      MC38_OPEN
+    ) {
+
+      doorWasPhysicallyOpen =
+        true;
     }
 
     if (
       doorWasPhysicallyOpen &&
-      doorState == MC38_CLOSED
+      currentDoorState ==
+        MC38_CLOSED
     ) {
-      doorWasPhysicallyOpen = false;
+
+      doorWasPhysicallyOpen =
+        false;
+
       startWaitMode();
     }
   }
 
-  if (state == WAIT) {
-    unsigned long elapsed = now - waitStart;
+  if (
+    state ==
+    WAIT
+  ) {
 
-    long remain =
-      (long)((WAIT_TIME - min(elapsed, WAIT_TIME)) / 1000);
+    unsigned long elapsed =
+      now -
+      waitStart;
 
-    if (remain < 0) remain = 0;
+    unsigned long limitedElapsed =
+      elapsed >
+        WAIT_TIME
+          ? WAIT_TIME
+          : elapsed;
 
-    if (remain != lastWaitRemain) {
-      lastWaitRemain = remain;
+    long remainingSeconds =
+      (
+        WAIT_TIME -
+        limitedElapsed
+      ) /
+      1000;
+
+    if (
+      remainingSeconds <
+      0
+    ) {
+
+      remainingSeconds =
+        0;
+    }
+
+    if (
+      remainingSeconds !=
+      lastWaitRemain
+    ) {
+
+      lastWaitRemain =
+        remainingSeconds;
 
       publishMsg(
         topic("wait"),
-        String(remain),
+        String(
+          remainingSeconds
+        ),
         true
       );
     }
 
-    if (elapsed >= WAIT_TIME) {
-      state = READY;
-      lastWaitRemain = -2;
+    if (
+      elapsed >=
+      WAIT_TIME
+    ) {
+
+      state =
+        READY;
+
+      lastWaitRemain =
+        -2;
 
       publishMsg(
         topic("state"),
@@ -983,10 +2923,15 @@ void handleStateMachine() {
   }
 
   if (
-    state == REFUSED &&
-    now - refusedStart >= REFUSED_TIME
+    state ==
+      REFUSED &&
+    now -
+      refusedStart >=
+    REFUSED_TIME
   ) {
-    state = READY;
+
+    state =
+      READY;
 
     publishMsg(
       topic("state"),
@@ -996,6 +2941,169 @@ void handleStateMachine() {
 
     updateLeds();
   }
+}
+
+/* =========================================================
+   BOUTON UNIQUE GPA2
+   ========================================================= */
+bool buttonPressedEdge() {
+
+  if (!mcpReady) {
+    return false;
+  }
+
+  int reading =
+    mcp.digitalRead(
+      MCP_BUTTON
+    );
+
+  unsigned long now =
+    millis();
+
+  if (
+    reading !=
+    buttonCandidateState
+  ) {
+
+    buttonCandidateState =
+      reading;
+
+    buttonCandidateTime =
+      now;
+  }
+
+  if (
+    buttonCandidateState !=
+      buttonStableState &&
+    now -
+      buttonCandidateTime >=
+    BUTTON_DEBOUNCE
+  ) {
+
+    int previousState =
+      buttonStableState;
+
+    buttonStableState =
+      buttonCandidateState;
+
+    return (
+      previousState ==
+        HIGH &&
+      buttonStableState ==
+        LOW
+    );
+  }
+
+  return false;
+}
+
+void handleButtons() {
+
+  if (
+    !buttonPressedEdge()
+  ) {
+
+    return;
+  }
+
+  int physicalDoorState =
+    digitalRead(
+      MC38_PIN
+    );
+
+  Serial.println(
+    "===== BOUTON GPA2 ====="
+  );
+
+  Serial.print(
+    "MC38 : "
+  );
+
+  Serial.println(
+    physicalDoorState ==
+      MC38_CLOSED
+        ? "PORTE FERMEE"
+        : "PORTE OUVERTE"
+  );
+
+  /*
+     Porte fermée :
+     ouverture.
+  */
+  if (
+    physicalDoorState ==
+    MC38_CLOSED
+  ) {
+
+    Serial.println(
+      "Bouton : demande OUVERTURE"
+    );
+
+    if (
+      openDoor(
+        "BUTTON_OPEN"
+      )
+    ) {
+
+      recordAccessEvent(
+        "OUVERTURE",
+        "BOUTON",
+        "BUTTON_OPEN",
+        "Ouverture manuelle",
+        "AUTHORIZED"
+      );
+    }
+
+    return;
+  }
+
+  /*
+     Porte ouverte :
+     demande fermeture.
+  */
+  Serial.println(
+    "Bouton : demande FERMETURE"
+  );
+
+  digitalWrite(
+    RELAY,
+    RELAY_OFF
+  );
+
+  relayActive =
+    false;
+
+  state =
+    OPEN;
+
+  doorWasPhysicallyOpen =
+    true;
+
+  publishMsg(
+    topic("state"),
+    "OPEN",
+    true
+  );
+
+  publishMsg(
+    topic("event"),
+    "manual_close_requested"
+  );
+
+  logSD(
+    "BUTTON: CLOSE REQUEST"
+  );
+
+  updateLeds();
+
+  /*
+     On ne dit pas encore "porte fermée" ici :
+     le MC38 indique encore OPEN.
+
+     L'annonce "Porte fermée" sera jouée
+     automatiquement dans startWaitMode()
+     dès que le MC38 confirme réellement CLOSED.
+  */
 }
 
 /* =========================================================
@@ -1025,7 +3133,7 @@ String readUidString(MFRC522& reader) {
 
 void handleOneRfid(
   MFRC522& reader,
-  const String& sens
+  const String& direction
 ) {
   if (!reader.PICC_IsNewCardPresent()) {
     return;
@@ -1035,55 +3143,84 @@ void handleOneRfid(
     return;
   }
 
-  String uid = readUidString(reader);
+  String uid =
+    readUidString(reader);
 
   Serial.print("RFID ");
-  Serial.print(sens);
-  Serial.print(" UID: ");
+  Serial.print(direction);
+  Serial.print(" UID : ");
   Serial.println(uid);
 
-  int idx = findRfid(uid);
+  int index =
+    findRfid(uid);
 
-  if (idx < 0) {
+  /* RFID inconnu */
+  if (index < 0) {
     publishMsg(
       topic("rfid_result"),
       "UNKNOWN"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
-      sens,
+      direction,
       "RFID",
       uid,
       "RFID inconnu",
-      "UNKNOWN"
+      "UNKNOWN",
+      dateText,
+      timeText
     );
 
     setRefused(
-      "rfid_unknown_" + sens
+      "rfid_unknown_" +
+      direction
     );
   }
-  else if (!rfidDb[idx].enabled) {
+
+  /* RFID désactivé */
+  else if (!rfidDb[index].enabled) {
     publishMsg(
       topic("rfid_result"),
       "DISABLED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
-      sens,
+      direction,
       "RFID",
       uid,
-      String(rfidDb[idx].name),
-      "DISABLED"
+      String(rfidDb[index].name),
+      "DISABLED",
+      dateText,
+      timeText
     );
 
     setRefused(
-      "rfid_disabled_" + sens
+      "rfid_disabled_" +
+      direction
     );
   }
+
+  /* Horaire interdit */
   else if (
     !checkTimeAccess(
-      rfidDb[idx].allowedFrom,
-      rfidDb[idx].allowedTo
+      rfidDb[index].allowedFrom,
+      rfidDb[index].allowedTo
     )
   ) {
     publishMsg(
@@ -1091,69 +3228,113 @@ void handleOneRfid(
       "TIME_DENIED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
-      sens,
+      direction,
       "RFID",
       uid,
-      String(rfidDb[idx].name),
-      "TIME_DENIED"
+      String(rfidDb[index].name),
+      "TIME_DENIED",
+      dateText,
+      timeText
     );
 
     setRefused(
-      "rfid_time_denied_" + sens
+      "rfid_time_denied_" +
+      direction
     );
   }
+
+  /* Limite d'utilisation */
   else if (
-    rfidDb[idx].maxUses > 0 &&
-    rfidDb[idx].usedCount >= rfidDb[idx].maxUses
+    rfidDb[index].maxUses > 0 &&
+    rfidDb[index].usedCount >=
+      rfidDb[index].maxUses
   ) {
     publishMsg(
       topic("rfid_result"),
       "USE_LIMIT_REACHED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
-      sens,
+      direction,
       "RFID",
       uid,
-      String(rfidDb[idx].name),
-      "USE_LIMIT_REACHED"
+      String(rfidDb[index].name),
+      "USE_LIMIT_REACHED",
+      dateText,
+      timeText
     );
 
     setRefused(
-      "rfid_use_limit_" + sens
+      "rfid_use_limit_" +
+      direction
     );
   }
-  else if (!isDoorAllowedForCard(idx)) {
+
+  /* Porte interdite */
+  else if (
+    !isDoorAllowedForCard(index)
+  ) {
     publishMsg(
       topic("rfid_result"),
       "DOOR_NOT_ALLOWED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
-      sens,
+      direction,
       "RFID",
       uid,
-      String(rfidDb[idx].name),
-      "DOOR_NOT_ALLOWED"
+      String(rfidDb[index].name),
+      "DOOR_NOT_ALLOWED",
+      dateText,
+      timeText
     );
 
     setRefused(
-      "door_not_allowed_" + sens
+      "door_not_allowed_" +
+      direction
     );
   }
+
+  /* Accès autorisé */
   else {
-    String source = "RFID_" + sens;
+    String source =
+      "RFID_" +
+      direction;
 
     if (openDoor(source)) {
-      rfidDb[idx].usedCount++;
+      rfidDb[index].usedCount++;
 
       publishMsg(
         topic("rfid_result"),
         "AUTHORIZED"
       );
 
-      if (sens == "ENTREE") {
+      if (direction == "ENTREE") {
         publishMsg(
           topic("rfid_consume"),
           uid
@@ -1174,7 +3355,10 @@ void handleOneRfid(
           "rfid_entry_authorized"
         );
       }
-      else {
+
+      else if (
+        direction == "SORTIE"
+      ) {
         publishMsg(
           topic("rfid_exit"),
           uid
@@ -1191,11 +3375,11 @@ void handleOneRfid(
         );
       }
 
-      logAccessHistory(
-        sens,
+      recordAccessEvent(
+        direction,
         "RFID",
         uid,
-        String(rfidDb[idx].name),
+        String(rfidDb[index].name),
         "AUTHORIZED"
       );
     }
@@ -1221,18 +3405,48 @@ void handleRfid() {
    EMPREINTE
    ========================================================= */
 void handleFinger() {
-  uint8_t p = finger.getImage();
+  uint8_t result =
+    finger.getImage();
 
-  if (p == FINGERPRINT_NOFINGER) return;
-  if (p != FINGERPRINT_OK) return;
-  if (finger.image2Tz() != FINGERPRINT_OK) return;
+  if (
+    result ==
+    FINGERPRINT_NOFINGER
+  ) {
+    return;
+  }
 
-  p = finger.fingerSearch();
+  if (
+    result !=
+    FINGERPRINT_OK
+  ) {
+    return;
+  }
 
-  if (p != FINGERPRINT_OK) {
+  if (
+    finger.image2Tz() !=
+    FINGERPRINT_OK
+  ) {
+    return;
+  }
+
+  result =
+    finger.fingerSearch();
+
+  if (
+    result !=
+    FINGERPRINT_OK
+  ) {
     publishMsg(
       topic("fingerprint_result"),
       "UNKNOWN"
+    );
+
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
     );
 
     logAccessHistory(
@@ -1240,58 +3454,106 @@ void handleFinger() {
       "EMPREINTE",
       "INCONNU",
       "Empreinte inconnue",
-      "UNKNOWN"
+      "UNKNOWN",
+      dateText,
+      timeText
     );
 
-    setRefused("finger_unknown");
+    setRefused(
+      "finger_unknown"
+    );
+
     return;
   }
 
-  int id = finger.fingerID;
+  int fingerId =
+    finger.fingerID;
+
+  Serial.print(
+    "Empreinte detectee ID : "
+  );
+
+  Serial.println(
+    fingerId
+  );
 
   publishMsg(
     topic("fingerprint"),
-    String(id)
+    String(fingerId)
   );
 
-  int idx = findFinger(id);
+  publishMsg(
+    topic("event"),
+    "finger_detected"
+  );
 
-  if (idx < 0) {
+  int index =
+    findFinger(fingerId);
+
+  if (index < 0) {
     publishMsg(
       topic("fingerprint_result"),
       "UNKNOWN"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
       "ENTREE",
       "EMPREINTE",
-      String(id),
+      String(fingerId),
       "Empreinte absente de la base",
-      "UNKNOWN"
+      "UNKNOWN",
+      dateText,
+      timeText
     );
 
-    setRefused("finger_not_in_db");
+    setRefused(
+      "finger_not_in_db"
+    );
   }
-  else if (!fingerDb[idx].enabled) {
+
+  else if (
+    !fingerDb[index].enabled
+  ) {
     publishMsg(
       topic("fingerprint_result"),
       "DISABLED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
       "ENTREE",
       "EMPREINTE",
-      String(id),
-      String(fingerDb[idx].name),
-      "DISABLED"
+      String(fingerId),
+      String(fingerDb[index].name),
+      "DISABLED",
+      dateText,
+      timeText
     );
 
-    setRefused("finger_disabled");
+    setRefused(
+      "finger_disabled"
+    );
   }
+
   else if (
     !checkTimeAccess(
-      fingerDb[idx].allowedFrom,
-      fingerDb[idx].allowedTo
+      fingerDb[index].allowedFrom,
+      fingerDb[index].allowedTo
     )
   ) {
     publishMsg(
@@ -1299,54 +3561,100 @@ void handleFinger() {
       "TIME_DENIED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
       "ENTREE",
       "EMPREINTE",
-      String(id),
-      String(fingerDb[idx].name),
-      "TIME_DENIED"
+      String(fingerId),
+      String(fingerDb[index].name),
+      "TIME_DENIED",
+      dateText,
+      timeText
     );
 
-    setRefused("finger_time_denied");
+    setRefused(
+      "finger_time_denied"
+    );
   }
+
   else if (
-    fingerDb[idx].maxUses > 0 &&
-    fingerDb[idx].usedCount >= fingerDb[idx].maxUses
+    fingerDb[index].maxUses > 0 &&
+    fingerDb[index].usedCount >=
+      fingerDb[index].maxUses
   ) {
     publishMsg(
       topic("fingerprint_result"),
       "USE_LIMIT_REACHED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
       "ENTREE",
       "EMPREINTE",
-      String(id),
-      String(fingerDb[idx].name),
-      "USE_LIMIT_REACHED"
+      String(fingerId),
+      String(fingerDb[index].name),
+      "USE_LIMIT_REACHED",
+      dateText,
+      timeText
     );
 
-    setRefused("finger_use_limit");
+    setRefused(
+      "finger_use_limit"
+    );
   }
-  else if (!isDoorAllowedForFinger(idx)) {
+
+  else if (
+    !isDoorAllowedForFinger(index)
+  ) {
     publishMsg(
       topic("fingerprint_result"),
       "DOOR_NOT_ALLOWED"
     );
 
+    String dateText;
+    String timeText;
+
+    getDateAndTime(
+      dateText,
+      timeText
+    );
+
     logAccessHistory(
       "ENTREE",
       "EMPREINTE",
-      String(id),
-      String(fingerDb[idx].name),
-      "DOOR_NOT_ALLOWED"
+      String(fingerId),
+      String(fingerDb[index].name),
+      "DOOR_NOT_ALLOWED",
+      dateText,
+      timeText
     );
 
-    setRefused("door_not_allowed");
+    setRefused(
+      "door_not_allowed"
+    );
   }
+
   else {
-    if (openDoor("FINGER")) {
-      fingerDb[idx].usedCount++;
+    if (
+      openDoor(
+        "FINGER"
+      )
+    ) {
+      fingerDb[index].usedCount++;
 
       publishMsg(
         topic("fingerprint_result"),
@@ -1355,14 +3663,24 @@ void handleFinger() {
 
       publishMsg(
         topic("fingerprint_consume"),
-        String(id)
+        String(fingerId)
       );
 
-      logAccessHistory(
+      publishMsg(
+        topic("access_direction"),
+        "IN"
+      );
+
+      publishMsg(
+        topic("event"),
+        "finger_entry_authorized"
+      );
+
+      recordAccessEvent(
         "ENTREE",
         "EMPREINTE",
-        String(id),
-        String(fingerDb[idx].name),
+        String(fingerId),
+        String(fingerDb[index].name),
         "AUTHORIZED"
       );
     }
@@ -1373,130 +3691,89 @@ void handleFinger() {
    CAPTEURS
    ========================================================= */
 void handleSensors() {
-  static int lastDoor = -1;
-  static int lastPir = -1;
+  static int lastDoorState = -1;
+  static int lastPirState = -1;
 
-  int doorNow = digitalRead(MC38_PIN);
-  int pirNow = digitalRead(PIR_PIN);
+  int currentDoorState =
+    digitalRead(MC38_PIN);
 
-  if (doorNow != lastDoor) {
-    lastDoor = doorNow;
+  int currentPirState =
+    digitalRead(PIR_PIN);
+
+  if (
+    currentDoorState !=
+    lastDoorState
+  ) {
+    lastDoorState =
+      currentDoorState;
 
     publishMsg(
       topic("door"),
-      doorNow == MC38_OPEN
-        ? "OPEN"
-        : "CLOSED",
+      currentDoorState ==
+        MC38_OPEN
+          ? "OPEN"
+          : "CLOSED",
       true
     );
   }
 
-  if (pirNow != lastPir) {
-    lastPir = pirNow;
+  if (
+    currentPirState !=
+    lastPirState
+  ) {
+    lastPirState =
+      currentPirState;
 
     publishMsg(
       topic("pir"),
-      pirNow == PIR_ACTIVE
-        ? "DETECTED"
-        : "CLEAR",
+      currentPirState ==
+        PIR_ACTIVE
+          ? "DETECTED"
+          : "CLEAR",
       true
     );
   }
 
   if (
-    millis() - lastDhtRead >=
+    millis() -
+      lastDhtRead >=
     DHT_INTERVAL
   ) {
-    lastDhtRead = millis();
+    lastDhtRead =
+      millis();
 
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
+    float humidity =
+      dht.readHumidity();
 
-    if (!isnan(t)) {
-      lastTemp = t;
+    float temperature =
+      dht.readTemperature();
+
+    if (!isnan(temperature)) {
+      lastTemp =
+        temperature;
 
       publishMsg(
         topic("temp"),
-        String(t, 1),
+        String(
+          temperature,
+          1
+        ),
         true
       );
     }
 
-    if (!isnan(h)) {
-      lastHum = h;
+    if (!isnan(humidity)) {
+      lastHum =
+        humidity;
 
       publishMsg(
         topic("hum"),
-        String(h, 1),
+        String(
+          humidity,
+          1
+        ),
         true
       );
-    }
-  }
-}
-
-/* =========================================================
-   BOUTONS
-   ========================================================= */
-bool buttonPressedEdge(
-  int pin,
-  int& stableState,
-  int& candidateState,
-  unsigned long& candidateTime
-) {
-  int reading = digitalRead(pin);
-  unsigned long now = millis();
-
-  if (reading != candidateState) {
-    candidateState = reading;
-    candidateTime = now;
-  }
-
-  if (
-    candidateState != stableState &&
-    now - candidateTime >= BUTTON_DEBOUNCE
-  ) {
-    int previousState = stableState;
-    stableState = candidateState;
-
-    return (
-      previousState == HIGH &&
-      stableState == LOW
-    );
-  }
-
-  return false;
-}
-
-void handleButtons() {
-  if (
-    buttonPressedEdge(
-      BUTTON_OPEN,
-      openStableState,
-      openCandidateState,
-      openCandidateTime
-    )
-  ) {
-    if (openDoor("BUTTON_OPEN")) {
-      logAccessHistory(
-        "OUVERTURE",
-        "BOUTON",
-        "BUTTON_OPEN",
-        "Ouverture manuelle",
-        "AUTHORIZED"
-      );
-    }
-  }
-
-  if (
-    buttonPressedEdge(
-      BUTTON_CLOSE,
-      closeStableState,
-      closeCandidateState,
-      closeCandidateTime
-    )
-  ) {
-    if (state == OPEN) {
-      startWaitMode();
     }
   }
 }
@@ -1508,14 +3785,23 @@ void loadRfidDb(
   const String& json,
   bool saveToSd = true
 ) {
-  StaticJsonDocument<16384> doc;
+  StaticJsonDocument<16384>
+    document;
 
   DeserializationError error =
-    deserializeJson(doc, json);
+    deserializeJson(
+      document,
+      json
+    );
 
   if (error) {
-    Serial.print("RFID JSON error: ");
-    Serial.println(error.c_str());
+    Serial.print(
+      "RFID JSON error : "
+    );
+
+    Serial.println(
+      error.c_str()
+    );
 
     publishMsg(
       topic("event"),
@@ -1527,92 +3813,147 @@ void loadRfidDb(
 
   clearRfidDb();
 
-  JsonArray arr = doc.as<JsonArray>();
-  int i = 0;
+  JsonArray array =
+    document.as<JsonArray>();
 
-  for (JsonObject o : arr) {
-    if (i >= MAX_RFID_USERS) break;
+  int index = 0;
+
+  for (
+    JsonObject object :
+    array
+  ) {
+    if (
+      index >=
+      MAX_RFID_USERS
+    ) {
+      break;
+    }
 
     String uid =
-      normalizeUid(o["uid"] | "");
+      normalizeUid(
+        object["uid"] | ""
+      );
 
     String name =
-      o["name"] | "";
+      object["name"] | "";
 
-    if (uid.length() == 0) continue;
+    if (
+      uid.length() == 0
+    ) {
+      continue;
+    }
 
-    String allowedDoors = "ALL";
+    String allowedDoors =
+      "ALL";
 
-    if (o["allowedDoors"].is<JsonArray>()) {
-      allowedDoors = "";
+    if (
+      object["allowedDoors"]
+        .is<JsonArray>()
+    ) {
+      allowedDoors =
+        "";
+
+      JsonArray doorsArray =
+        object["allowedDoors"]
+          .as<JsonArray>();
 
       for (
-        String d :
-        o["allowedDoors"].as<JsonArray>()
+        String allowedDoor :
+        doorsArray
       ) {
-        if (allowedDoors.length() > 0) {
+        if (
+          allowedDoors.length() >
+          0
+        ) {
           allowedDoors += ",";
         }
 
-        allowedDoors += d;
+        allowedDoors +=
+          allowedDoor;
       }
     }
 
     strncpy(
-      rfidDb[i].uid,
+      rfidDb[index].uid,
       uid.c_str(),
-      sizeof(rfidDb[i].uid) - 1
+      sizeof(
+        rfidDb[index].uid
+      ) - 1
     );
 
-    rfidDb[i].uid[
-      sizeof(rfidDb[i].uid) - 1
+    rfidDb[index].uid[
+      sizeof(
+        rfidDb[index].uid
+      ) - 1
     ] = '\0';
 
     strncpy(
-      rfidDb[i].name,
+      rfidDb[index].name,
       name.c_str(),
-      sizeof(rfidDb[i].name) - 1
+      sizeof(
+        rfidDb[index].name
+      ) - 1
     );
 
-    rfidDb[i].name[
-      sizeof(rfidDb[i].name) - 1
+    rfidDb[index].name[
+      sizeof(
+        rfidDb[index].name
+      ) - 1
     ] = '\0';
 
     strncpy(
-      rfidDb[i].allowedDoors,
+      rfidDb[index]
+        .allowedDoors,
       allowedDoors.c_str(),
-      sizeof(rfidDb[i].allowedDoors) - 1
+      sizeof(
+        rfidDb[index]
+          .allowedDoors
+      ) - 1
     );
 
-    rfidDb[i].allowedDoors[
-      sizeof(rfidDb[i].allowedDoors) - 1
-    ] = '\0';
+    rfidDb[index]
+      .allowedDoors[
+        sizeof(
+          rfidDb[index]
+            .allowedDoors
+        ) - 1
+      ] = '\0';
 
-    rfidDb[i].enabled =
-      o["enabled"] | true;
+    rfidDb[index].enabled =
+      object["enabled"] | true;
 
-    rfidDb[i].allowedFrom =
-      o["allowedFrom"] | 0UL;
+    rfidDb[index].allowedFrom =
+      object["allowedFrom"] | 0UL;
 
-    rfidDb[i].allowedTo =
-      o["allowedTo"] | 0UL;
+    rfidDb[index].allowedTo =
+      object["allowedTo"] | 0UL;
 
-    rfidDb[i].maxUses =
-      o["maxUses"] | 0;
+    rfidDb[index].maxUses =
+      object["maxUses"] | 0;
 
-    rfidDb[i].usedCount =
-      o["usedCount"] | 0;
+    rfidDb[index].usedCount =
+      object["usedCount"] | 0;
 
-    rfidDb[i].used = true;
+    rfidDb[index].used =
+      true;
 
-    i++;
+    index++;
   }
 
-  Serial.print("RFID users loaded: ");
-  Serial.println(i);
+  Serial.print(
+    "RFID users loaded : "
+  );
 
-  if (saveToSd && sdReady) {
-    writeFileSD(RFID_FILE, json);
+  Serial.println(index);
+
+  if (
+    saveToSd &&
+    sdReady
+  ) {
+    writeFileSD(
+      RFID_FILE,
+      json
+    );
   }
 
   publishMsg(
@@ -1628,14 +3969,23 @@ void loadFingerDb(
   const String& json,
   bool saveToSd = true
 ) {
-  StaticJsonDocument<16384> doc;
+  StaticJsonDocument<16384>
+    document;
 
   DeserializationError error =
-    deserializeJson(doc, json);
+    deserializeJson(
+      document,
+      json
+    );
 
   if (error) {
-    Serial.print("Finger JSON error: ");
-    Serial.println(error.c_str());
+    Serial.print(
+      "Finger JSON error : "
+    );
+
+    Serial.println(
+      error.c_str()
+    );
 
     publishMsg(
       topic("event"),
@@ -1647,81 +3997,134 @@ void loadFingerDb(
 
   clearFingerDb();
 
-  JsonArray arr = doc.as<JsonArray>();
-  int i = 0;
+  JsonArray array =
+    document.as<JsonArray>();
 
-  for (JsonObject o : arr) {
-    if (i >= MAX_FINGER_USERS) break;
+  int index = 0;
 
-    int id = o["fingerId"] | -1;
-    String name = o["name"] | "";
+  for (
+    JsonObject object :
+    array
+  ) {
+    if (
+      index >=
+      MAX_FINGER_USERS
+    ) {
+      break;
+    }
 
-    if (id < 0) continue;
+    int fingerId =
+      object["fingerId"] | -1;
 
-    String allowedDoors = "ALL";
+    String name =
+      object["name"] | "";
 
-    if (o["allowedDoors"].is<JsonArray>()) {
-      allowedDoors = "";
+    if (
+      fingerId < 0
+    ) {
+      continue;
+    }
+
+    String allowedDoors =
+      "ALL";
+
+    if (
+      object["allowedDoors"]
+        .is<JsonArray>()
+    ) {
+      allowedDoors =
+        "";
+
+      JsonArray doorsArray =
+        object["allowedDoors"]
+          .as<JsonArray>();
 
       for (
-        String d :
-        o["allowedDoors"].as<JsonArray>()
+        String allowedDoor :
+        doorsArray
       ) {
-        if (allowedDoors.length() > 0) {
+        if (
+          allowedDoors.length() >
+          0
+        ) {
           allowedDoors += ",";
         }
 
-        allowedDoors += d;
+        allowedDoors +=
+          allowedDoor;
       }
     }
 
-    fingerDb[i].id = id;
+    fingerDb[index].id =
+      fingerId;
 
     strncpy(
-      fingerDb[i].name,
+      fingerDb[index].name,
       name.c_str(),
-      sizeof(fingerDb[i].name) - 1
+      sizeof(
+        fingerDb[index].name
+      ) - 1
     );
 
-    fingerDb[i].name[
-      sizeof(fingerDb[i].name) - 1
+    fingerDb[index].name[
+      sizeof(
+        fingerDb[index].name
+      ) - 1
     ] = '\0';
 
     strncpy(
-      fingerDb[i].allowedDoors,
+      fingerDb[index]
+        .allowedDoors,
       allowedDoors.c_str(),
-      sizeof(fingerDb[i].allowedDoors) - 1
+      sizeof(
+        fingerDb[index]
+          .allowedDoors
+      ) - 1
     );
 
-    fingerDb[i].allowedDoors[
-      sizeof(fingerDb[i].allowedDoors) - 1
-    ] = '\0';
+    fingerDb[index]
+      .allowedDoors[
+        sizeof(
+          fingerDb[index]
+            .allowedDoors
+        ) - 1
+      ] = '\0';
 
-    fingerDb[i].enabled =
-      o["enabled"] | true;
+    fingerDb[index].enabled =
+      object["enabled"] | true;
 
-    fingerDb[i].allowedFrom =
-      o["allowedFrom"] | 0UL;
+    fingerDb[index].allowedFrom =
+      object["allowedFrom"] | 0UL;
 
-    fingerDb[i].allowedTo =
-      o["allowedTo"] | 0UL;
+    fingerDb[index].allowedTo =
+      object["allowedTo"] | 0UL;
 
-    fingerDb[i].maxUses =
-      o["maxUses"] | 0;
+    fingerDb[index].maxUses =
+      object["maxUses"] | 0;
 
-    fingerDb[i].usedCount =
-      o["usedCount"] | 0;
+    fingerDb[index].usedCount =
+      object["usedCount"] | 0;
 
-    fingerDb[i].used = true;
+    fingerDb[index].used =
+      true;
 
-    i++;
+    index++;
   }
 
-  Serial.print("Finger users loaded: ");
-  Serial.println(i);
+  Serial.print(
+    "Finger users loaded : "
+  );
 
-  if (saveToSd && sdReady) {
-    writeFileSD(FINGER_FILE, json);
+  Serial.println(index);
+
+  if (
+    saveToSd &&
+    sdReady
+  ) {
+    writeFileSD(
+      FINGER_FILE,
+      json
+    );
   }
 
   publishMsg(
@@ -1730,6 +4133,9 @@ void loadFingerDb(
   );
 }
 
+/* =========================================================
+   CHARGEMENT BASES DEPUIS SD
+   ========================================================= */
 void loadDatabasesFromSD() {
   if (!sdReady) {
     Serial.println(
@@ -1742,8 +4148,14 @@ void loadDatabasesFromSD() {
   String rfidJson =
     readFileSD(RFID_FILE);
 
-  if (rfidJson.length() > 5) {
-    loadRfidDb(rfidJson, false);
+  if (
+    rfidJson.length() >
+    5
+  ) {
+    loadRfidDb(
+      rfidJson,
+      false
+    );
   }
   else {
     Serial.println(
@@ -1754,8 +4166,14 @@ void loadDatabasesFromSD() {
   String fingerJson =
     readFileSD(FINGER_FILE);
 
-  if (fingerJson.length() > 5) {
-    loadFingerDb(fingerJson, false);
+  if (
+    fingerJson.length() >
+    5
+  ) {
+    loadFingerDb(
+      fingerJson,
+      false
+    );
   }
   else {
     Serial.println(
@@ -1768,9 +4186,14 @@ void loadDatabasesFromSD() {
    ENREGISTREMENT EMPREINTE
    ========================================================= */
 void enrollFinger(int id) {
-  if (id < 1 || id > 127) {
+  if (
+    id < 1 ||
+    id > 127
+  ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:invalid_id",
       true
     );
@@ -1779,22 +4202,35 @@ void enrollFinger(int id) {
   }
 
   publishMsg(
-    topic("finger_enroll_status"),
+    topic(
+      "finger_enroll_status"
+    ),
     "put_finger",
     true
   );
 
-  unsigned long start = millis();
+  unsigned long start =
+    millis();
 
   while (
     finger.getImage() !=
     FINGERPRINT_OK
   ) {
-    client.loop();
+    if (
+      client.connected()
+    ) {
+      client.loop();
+    }
 
-    if (millis() - start > 30000) {
+    if (
+      millis() -
+        start >
+      30000
+    ) {
       publishMsg(
-        topic("finger_enroll_result"),
+        topic(
+          "finger_enroll_result"
+        ),
         "ERROR:timeout_first_image",
         true
       );
@@ -1810,7 +4246,9 @@ void enrollFinger(int id) {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:first_image",
       true
     );
@@ -1819,23 +4257,37 @@ void enrollFinger(int id) {
   }
 
   publishMsg(
-    topic("finger_enroll_status"),
+    topic(
+      "finger_enroll_status"
+    ),
     "remove_finger",
     true
   );
 
   delay(2000);
-  start = millis();
+
+  start =
+    millis();
 
   while (
     finger.getImage() !=
     FINGERPRINT_NOFINGER
   ) {
-    client.loop();
+    if (
+      client.connected()
+    ) {
+      client.loop();
+    }
 
-    if (millis() - start > 15000) {
+    if (
+      millis() -
+        start >
+      15000
+    ) {
       publishMsg(
-        topic("finger_enroll_result"),
+        topic(
+          "finger_enroll_result"
+        ),
         "ERROR:remove_timeout",
         true
       );
@@ -1847,22 +4299,35 @@ void enrollFinger(int id) {
   }
 
   publishMsg(
-    topic("finger_enroll_status"),
+    topic(
+      "finger_enroll_status"
+    ),
     "put_same_finger",
     true
   );
 
-  start = millis();
+  start =
+    millis();
 
   while (
     finger.getImage() !=
     FINGERPRINT_OK
   ) {
-    client.loop();
+    if (
+      client.connected()
+    ) {
+      client.loop();
+    }
 
-    if (millis() - start > 30000) {
+    if (
+      millis() -
+        start >
+      30000
+    ) {
       publishMsg(
-        topic("finger_enroll_result"),
+        topic(
+          "finger_enroll_result"
+        ),
         "ERROR:timeout_second_image",
         true
       );
@@ -1878,7 +4343,9 @@ void enrollFinger(int id) {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:second_image",
       true
     );
@@ -1891,7 +4358,9 @@ void enrollFinger(int id) {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:create_model",
       true
     );
@@ -1904,7 +4373,9 @@ void enrollFinger(int id) {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:store_model",
       true
     );
@@ -1913,14 +4384,19 @@ void enrollFinger(int id) {
   }
 
   publishMsg(
-    topic("finger_enroll_status"),
+    topic(
+      "finger_enroll_status"
+    ),
     "finger_saved",
     true
   );
 
   publishMsg(
-    topic("finger_enroll_result"),
-    "SUCCESS:" + String(id),
+    topic(
+      "finger_enroll_result"
+    ),
+    "SUCCESS:" +
+      String(id),
     true
   );
 
@@ -1936,8 +4412,11 @@ void deleteFinger(int id) {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
-      "DELETED:" + String(id),
+      topic(
+        "finger_enroll_result"
+      ),
+      "DELETED:" +
+        String(id),
       true
     );
 
@@ -1948,7 +4427,9 @@ void deleteFinger(int id) {
   }
   else {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:delete",
       true
     );
@@ -1961,16 +4442,22 @@ void clearFingerSensor() {
     FINGERPRINT_OK
   ) {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "CLEARED_ALL",
       true
     );
 
-    logSD("FINGER DATABASE CLEARED");
+    logSD(
+      "FINGER DATABASE CLEARED"
+    );
   }
   else {
     publishMsg(
-      topic("finger_enroll_result"),
+      topic(
+        "finger_enroll_result"
+      ),
       "ERROR:clear_all",
       true
     );
@@ -1978,66 +4465,143 @@ void clearFingerSensor() {
 }
 
 /* =========================================================
-   MQTT CALLBACK
+   VALIDATION DU NOM
    ========================================================= */
-bool validName(String n) {
-  n.trim();
+bool validName(
+  String name
+) {
+  name.trim();
 
-  if (n.length() == 0) return false;
-  if (n.indexOf("/") >= 0) return false;
-  if (n.indexOf("+") >= 0) return false;
-  if (n.indexOf("#") >= 0) return false;
+  if (
+    name.length() == 0
+  ) {
+    return false;
+  }
+
+  if (
+    name.indexOf("/") >= 0 ||
+    name.indexOf("+") >= 0 ||
+    name.indexOf("#") >= 0
+  ) {
+    return false;
+  }
 
   return true;
 }
 
+/* =========================================================
+   MQTT CALLBACK
+   ========================================================= */
 void mqttCallback(
-  char* top,
+  char* receivedTopic,
   byte* payload,
   unsigned int length
 ) {
-  String msg = "";
+  String message =
+    "";
 
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
+  for (
+    unsigned int i = 0;
+    i < length;
+    i++
+  ) {
+    message +=
+      (char)payload[i];
   }
 
-  msg.trim();
+  message.trim();
 
-  String t = String(top);
+  String mqttTopic =
+    String(receivedTopic);
 
+  Serial.print(
+    "MQTT RECU : "
+  );
+
+  Serial.print(
+    mqttTopic
+  );
+
+  Serial.print(
+    " = "
+  );
+
+  Serial.println(
+    message
+  );
+
+  /* ACK */
   if (
-    t == "sas/" + deviceId + "/config/name" ||
-    t == "sas/" + doorId + "/config/name"
+    mqttTopic ==
+    topic("access_ack")
   ) {
-    if (validName(msg)) {
-      prefs.putString("doorId", msg);
-      doorId = msg;
+    handleAccessAck(
+      message
+    );
+
+    return;
+  }
+
+  /* Changement nom */
+  if (
+    mqttTopic ==
+      "sas/" +
+      deviceId +
+      "/config/name" ||
+    mqttTopic ==
+      "sas/" +
+      doorId +
+      "/config/name"
+  ) {
+    if (
+      validName(message)
+    ) {
+      prefs.putString(
+        "doorId",
+        message
+      );
+
+      doorId =
+        message;
 
       saveConfigToSD();
 
       publishMsg(
-        "sas/" + deviceId + "/config/status",
+        "sas/" +
+          deviceId +
+          "/config/status",
         "name_saved_restart",
         true
       );
 
       delay(500);
+
       ESP.restart();
     }
     else {
       publishMsg(
-        "sas/" + deviceId + "/config/status",
+        "sas/" +
+          deviceId +
+          "/config/status",
         "invalid_name",
         true
       );
     }
   }
 
-  else if (t == topic("cmd")) {
-    if (msg == "OPEN") {
-      if (openDoor("CMD")) {
-        logAccessHistory(
+  /* Commandes porte */
+  else if (
+    mqttTopic ==
+    topic("cmd")
+  ) {
+    if (
+      message ==
+      "OPEN"
+    ) {
+      if (
+        openDoor("CMD")
+      ) {
+        recordAccessEvent(
           "OUVERTURE",
           "MQTT",
           "CMD_OPEN",
@@ -2046,19 +4610,42 @@ void mqttCallback(
         );
       }
     }
-    else if (msg == "CLOSE") {
-      if (state == OPEN) {
+
+    else if (
+      message ==
+      "CLOSE"
+    ) {
+      if (
+        state ==
+        OPEN
+      ) {
         startWaitMode();
       }
     }
-    else if (msg == "RESET") {
+
+    else if (
+      message ==
+      "RESET"
+    ) {
       resetDoor();
     }
   }
 
-  else if (t == topic("lock")) {
-    if (msg == "LOCKED") {
-      relationLocked = true;
+  /* Lock Node-RED */
+  else if (
+    mqttTopic ==
+    topic("lock")
+  ) {
+    if (
+      message ==
+      "LOCKED"
+    ) {
+      relationLocked =
+        true;
+
+      Serial.println(
+        "RELATION SAS : LOCKED"
+      );
 
       publishMsg(
         topic("event"),
@@ -2071,13 +4658,25 @@ void mqttCallback(
         true
       );
 
-      logSD("RELATION LOCKED");
+      logSD(
+        "RELATION LOCKED"
+      );
 
       beepDouble();
+
       updateLeds();
     }
-    else if (msg == "UNLOCKED") {
-      relationLocked = false;
+
+    else if (
+      message ==
+      "UNLOCKED"
+    ) {
+      relationLocked =
+        false;
+
+      Serial.println(
+        "RELATION SAS : UNLOCKED"
+      );
 
       publishMsg(
         topic("event"),
@@ -2090,130 +4689,243 @@ void mqttCallback(
         true
       );
 
-      logSD("RELATION UNLOCKED");
+      logSD(
+        "RELATION UNLOCKED"
+      );
 
       beepShort();
+
       updateLeds();
     }
   }
 
-  else if (t == "sas/rfid/db") {
-    loadRfidDb(msg, true);
+  /* Base RFID */
+  else if (
+    mqttTopic ==
+    "sas/rfid/db"
+  ) {
+    loadRfidDb(
+      message,
+      true
+    );
   }
 
-  else if (t == "sas/finger/db") {
-    loadFingerDb(msg, true);
+  /* Base empreintes */
+  else if (
+    mqttTopic ==
+    "sas/finger/db"
+  ) {
+    loadFingerDb(
+      message,
+      true
+    );
   }
 
-  else if (t == topic("finger/cmd")) {
-    if (msg.startsWith("ENROLL:")) {
+  /* Commandes empreintes */
+  else if (
+    mqttTopic ==
+    topic("finger/cmd")
+  ) {
+    if (
+      message.startsWith(
+        "ENROLL:"
+      )
+    ) {
       enrollFinger(
-        msg.substring(7).toInt()
+        message
+          .substring(7)
+          .toInt()
       );
     }
-    else if (msg.startsWith("DELETE:")) {
+
+    else if (
+      message.startsWith(
+        "DELETE:"
+      )
+    ) {
       deleteFinger(
-        msg.substring(7).toInt()
+        message
+          .substring(7)
+          .toInt()
       );
     }
-    else if (msg == "CLEAR_ALL") {
+
+    else if (
+      message ==
+      "CLEAR_ALL"
+    ) {
       clearFingerSensor();
     }
   }
 
+  /* Ancien contrôle global optionnel */
   else if (
-    t.startsWith("sas/") &&
-    t.endsWith("/state")
+    USE_GLOBAL_DOOR_STATE_LOCK &&
+    mqttTopic.startsWith(
+      "sas/"
+    ) &&
+    mqttTopic.endsWith(
+      "/state"
+    )
   ) {
-    String other =
-      t.substring(
+    String otherDoor =
+      mqttTopic.substring(
         4,
-        t.length() - 6
+        mqttTopic.length() - 6
       );
 
     if (
-      other != doorId &&
-      other != deviceId
+      otherDoor != doorId &&
+      otherDoor != deviceId
     ) {
       if (
-        msg == "OPEN" ||
-        msg == "WAIT"
+        message == "OPEN" ||
+        message == "WAIT"
       ) {
-        otherDoorBusy = true;
+        otherDoorBusy =
+          true;
       }
+
       else if (
-        msg == "READY" ||
-        msg == "REFUSED"
+        message == "READY" ||
+        message == "REFUSED"
       ) {
-        otherDoorBusy = false;
+        otherDoorBusy =
+          false;
       }
     }
   }
 }
 
 /* =========================================================
-   WIFI
+   WIFI NON BLOQUANT
    ========================================================= */
-void setupWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
+void startWifi() {
+  WiFi.mode(
+    WIFI_STA
+  );
+
+  WiFi.persistent(
+    false
+  );
+
+  WiFi.setAutoReconnect(
+    true
+  );
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+  lastWifiReconnect =
+    millis();
+
+  Serial.println(
+    "Connexion WiFi lancee en arriere-plan"
+  );
+}
+
+void maintainWifi() {
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  ) {
     return;
   }
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  unsigned long now =
+    millis();
 
-  Serial.print("Connexion WiFi");
-
-  unsigned long start = millis();
-
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - start < 10000
+  if (
+    now -
+      lastWifiReconnect <
+    WIFI_RECONNECT_TIME
   ) {
-    Serial.print(".");
-    delay(500);
-    updateLeds();
+    return;
   }
 
-  Serial.println();
+  lastWifiReconnect =
+    now;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connecte");
+  WiFi.reconnect();
 
-    Serial.print("IP : ");
-    Serial.println(WiFi.localIP());
-  }
-  else {
-    Serial.println("WiFi non connecte");
-  }
+  Serial.println(
+    "Nouvelle tentative WiFi non bloquante"
+  );
 }
 
 /* =========================================================
-   MQTT RECONNECT
+   RECONNEXION MQTT
    ========================================================= */
 void reconnectMqtt() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (client.connected()) return;
+  if (
+    WiFi.status() !=
+    WL_CONNECTED
+  ) {
+    return;
+  }
+
+  if (
+    client.connected()
+  ) {
+    return;
+  }
 
   String clientId =
     "SAS_" +
     deviceId +
     "_" +
-    String((uint32_t)millis(), HEX);
+    String(
+      (uint32_t)millis(),
+      HEX
+    );
 
-  Serial.print("Connexion MQTT...");
+  Serial.print(
+    "Connexion MQTT..."
+  );
 
-  if (!client.connect(clientId.c_str())) {
-    Serial.print("Erreur : ");
-    Serial.println(client.state());
+  if (
+    !client.connect(
+      clientId.c_str()
+    )
+  ) {
+    Serial.print(
+      "Erreur : "
+    );
+
+    Serial.println(
+      client.state()
+    );
+
     return;
   }
 
-  Serial.println("OK");
+  Serial.println(
+    "OK"
+  );
 
-  client.subscribe(topic("cmd").c_str());
-  client.subscribe(topic("finger/cmd").c_str());
-  client.subscribe(topic("lock").c_str());
+  relationLocked =
+    false;
+
+  otherDoorBusy =
+    false;
+
+  client.subscribe(
+    topic("cmd").c_str()
+  );
+
+  client.subscribe(
+    topic("finger/cmd").c_str()
+  );
+
+  client.subscribe(
+    topic("lock").c_str()
+  );
+
+  client.subscribe(
+    topic("access_ack").c_str()
+  );
 
   client.subscribe(
     (
@@ -2231,9 +4943,21 @@ void reconnectMqtt() {
     ).c_str()
   );
 
-  client.subscribe("sas/rfid/db");
-  client.subscribe("sas/finger/db");
-  client.subscribe("sas/+/state");
+  client.subscribe(
+    "sas/rfid/db"
+  );
+
+  client.subscribe(
+    "sas/finger/db"
+  );
+
+  if (
+    USE_GLOBAL_DOOR_STATE_LOCK
+  ) {
+    client.subscribe(
+      "sas/+/state"
+    );
+  }
 
   publishMsg(
     topic("status"),
@@ -2256,19 +4980,38 @@ void reconnectMqtt() {
   );
 
   publishMsg(
-    "sas/" + deviceId + "/info",
+    "sas/" +
+      deviceId +
+      "/info",
     doorId,
     true
   );
 
   publishMsg(
-    "sas/" + deviceId + "/status",
+    "sas/" +
+      deviceId +
+      "/status",
     "online",
     true
   );
 
   publishAll();
   updateLeds();
+
+  waitingAccessAck =
+    false;
+
+  waitingEventId =
+    "";
+
+  waitingEventJson =
+    "";
+
+  lastSyncPublish =
+    0;
+
+  lastSyncCheck =
+    0;
 }
 
 /* =========================================================
@@ -2281,15 +5024,30 @@ void initRfidReaders() {
     RFID_MOSI
   );
 
-  pinMode(RFID_IN_SS, OUTPUT);
-  pinMode(RFID_OUT_SS, OUTPUT);
+  pinMode(
+    RFID_IN_SS,
+    OUTPUT
+  );
 
-  digitalWrite(RFID_IN_SS, HIGH);
-  digitalWrite(RFID_OUT_SS, HIGH);
+  pinMode(
+    RFID_OUT_SS,
+    OUTPUT
+  );
+
+  digitalWrite(
+    RFID_IN_SS,
+    HIGH
+  );
+
+  digitalWrite(
+    RFID_OUT_SS,
+    HIGH
+  );
 
   delay(100);
 
   rfidIn.PCD_Init();
+
   delay(100);
 
   byte versionIn =
@@ -2297,13 +5055,27 @@ void initRfidReaders() {
       MFRC522::VersionReg
     );
 
-  Serial.print("RFID ENTREE version: 0x");
-  Serial.println(versionIn, HEX);
+  Serial.print(
+    "RFID ENTREE version : 0x"
+  );
 
-  digitalWrite(RFID_IN_SS, HIGH);
-  digitalWrite(RFID_OUT_SS, HIGH);
+  Serial.println(
+    versionIn,
+    HEX
+  );
+
+  digitalWrite(
+    RFID_IN_SS,
+    HIGH
+  );
+
+  digitalWrite(
+    RFID_OUT_SS,
+    HIGH
+  );
 
   rfidOut.PCD_Init();
+
   delay(100);
 
   byte versionOut =
@@ -2311,27 +5083,41 @@ void initRfidReaders() {
       MFRC522::VersionReg
     );
 
-  Serial.print("RFID SORTIE version: 0x");
-  Serial.println(versionOut, HEX);
+  Serial.print(
+    "RFID SORTIE version : 0x"
+  );
+
+  Serial.println(
+    versionOut,
+    HEX
+  );
 
   if (
     versionIn == 0x00 ||
     versionIn == 0xFF
   ) {
-    Serial.println("ERREUR RFID ENTREE");
+    Serial.println(
+      "ERREUR RFID ENTREE"
+    );
   }
   else {
-    Serial.println("RFID ENTREE OK");
+    Serial.println(
+      "RFID ENTREE OK"
+    );
   }
 
   if (
     versionOut == 0x00 ||
     versionOut == 0xFF
   ) {
-    Serial.println("ERREUR RFID SORTIE");
+    Serial.println(
+      "ERREUR RFID SORTIE"
+    );
   }
   else {
-    Serial.println("RFID SORTIE OK");
+    Serial.println(
+      "RFID SORTIE OK"
+    );
   }
 }
 
@@ -2339,78 +5125,137 @@ void initRfidReaders() {
    SETUP
    ========================================================= */
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(
+    115200
+  );
+
   delay(500);
 
   Serial.println();
-  Serial.println("==============================");
-  Serial.println("DEMARRAGE SYSTEME SAS");
-  Serial.println("==============================");
+  Serial.println(
+    "=============================="
+  );
+
+  Serial.println(
+    "DEMARRAGE SYSTEME SAS"
+  );
+
+  Serial.println(
+    "=============================="
+  );
 
   prefs.begin(
     "sas_config",
     false
   );
 
-  deviceId = makeDeviceId();
+  deviceId =
+    makeDeviceId();
 
-  doorId = prefs.getString(
-    "doorId",
+  doorId =
+    prefs.getString(
+      "doorId",
+      deviceId
+    );
+
+  Serial.println(
+    "Device ID : " +
     deviceId
   );
 
   Serial.println(
-    "Device ID: " + deviceId
-  );
-
-  Serial.println(
-    "Door ID: " + doorId
+    "Door ID : " +
+    doorId
   );
 
   clearRfidDb();
   clearFingerDb();
 
-  pinMode(LED_GREEN, OUTPUT);
-  pinMode(LED_RED, OUTPUT);
-  pinMode(LED_STATUS, OUTPUT);
+  /* GPIO ESP32 */
 
-  pinMode(BUZZER, OUTPUT);
-  pinMode(RELAY, OUTPUT);
+  pinMode(
+    RELAY,
+    OUTPUT
+  );
 
-  pinMode(BUTTON_OPEN, INPUT);
-  pinMode(BUTTON_CLOSE, INPUT);
+  pinMode(
+    MC38_PIN,
+    INPUT
+  );
 
-  pinMode(MC38_PIN, INPUT);
-  pinMode(PIR_PIN, INPUT);
+  pinMode(
+    PIR_PIN,
+    INPUT
+  );
 
-  digitalWrite(RELAY, RELAY_OFF);
-  digitalWrite(BUZZER, LOW);
+  digitalWrite(
+    RELAY,
+    RELAY_OFF
+  );
 
-  digitalWrite(LED_GREEN, LOW);
-  digitalWrite(LED_RED, LOW);
-  digitalWrite(LED_STATUS, LOW);
+  /* MCP23017 */
 
-  delay(100);
+  initMcp23017();
 
-  openStableState =
-    digitalRead(BUTTON_OPEN);
-
-  openCandidateState =
-    openStableState;
-
-  closeStableState =
-    digitalRead(BUTTON_CLOSE);
-
-  closeCandidateState =
-    closeStableState;
-
-  openCandidateTime = millis();
-  closeCandidateTime = millis();
+  /* RFID */
 
   initRfidReaders();
 
+  /* SD */
+
   initSD();
+
   loadDatabasesFromSD();
+
+  /* Vérification fichiers audio */
+
+  if (sdReady) {
+    Serial.println(
+      "Verification fichiers audio :"
+    );
+
+    Serial.print(
+      AUDIO_DOOR_OPEN
+    );
+
+    Serial.println(
+      SD.exists(
+        AUDIO_DOOR_OPEN
+      )
+        ? " : OK"
+        : " : ABSENT"
+    );
+
+    Serial.print(
+      AUDIO_DOOR_CLOSED
+    );
+
+    Serial.println(
+      SD.exists(
+        AUDIO_DOOR_CLOSED
+      )
+        ? " : OK"
+        : " : ABSENT"
+    );
+
+    Serial.print(
+      AUDIO_ACCESS_DENIED
+    );
+
+    Serial.println(
+      SD.exists(
+        AUDIO_ACCESS_DENIED
+      )
+        ? " : OK"
+        : " : ABSENT"
+    );
+  }
+
+  /* Audio MAX98357A */
+
+  initAudio();
+
+  /* Empreinte */
 
   fingerSerial.begin(
     57600,
@@ -2419,124 +5264,178 @@ void setup() {
     FINGER_TX
   );
 
-  finger.begin(57600);
+  finger.begin(
+    57600
+  );
+
   delay(100);
 
-  if (finger.verifyPassword()) {
-    Serial.println("Capteur empreinte OK");
+  if (
+    finger.verifyPassword()
+  ) {
+    Serial.println(
+      "Capteur empreinte OK"
+    );
   }
   else {
-    Serial.println("Capteur empreinte ERROR");
+    Serial.println(
+      "Capteur empreinte ERROR"
+    );
   }
+
+  /* DHT */
 
   dht.begin();
 
-  setupWifi();
+  /* MQTT */
 
-  if (WiFi.status() == WL_CONNECTED) {
-    configTime(
-      gmtOffset_sec,
-      daylightOffset_sec,
-      ntpServer1,
-      ntpServer2
-    );
-
-    client.setServer(
-      mqtt_server,
-      mqtt_port
-    );
-
-    client.setCallback(
-      mqttCallback
-    );
-
-    client.setBufferSize(4096);
-
-    reconnectMqtt();
-  }
-
-  if (finger.verifyPassword()) {
-    publishMsg(
-      topic("event"),
-      "finger_sensor_ok"
-    );
-  }
-  else {
-    publishMsg(
-      topic("event"),
-      "finger_sensor_error"
-    );
-  }
-
-  publishMsg(
-    topic("sd_status"),
-    sdReady ? "OK" : "ERROR",
-    true
+  client.setServer(
+    mqtt_server,
+    mqtt_port
   );
+
+  client.setCallback(
+    mqttCallback
+  );
+
+  client.setBufferSize(
+    4096
+  );
+
+  client.setSocketTimeout(
+    2
+  );
+
+  /* NTP */
+
+  configTime(
+    gmtOffset_sec,
+    daylightOffset_sec,
+    ntpServer1,
+    ntpServer2
+  );
+
+  /* WiFi */
+
+  startWifi();
+
+  /* LEDs */
 
   updateLeds();
 
-  Serial.println("Setup termine");
+  Serial.println(
+    "Setup termine"
+  );
+
+  Serial.println(
+    "LED verte/rouge via MCP23017"
+  );
+
+  Serial.println(
+    "Bouton unique via GPA2"
+  );
+
+  Serial.println(
+    "Audio via MAX98357A"
+  );
 }
 
 /* =========================================================
    LOOP
    ========================================================= */
 void loop() {
-  unsigned long now = millis();
+  unsigned long now =
+    millis();
 
-  if (WiFi.status() == WL_CONNECTED) {
+  /* WiFi */
+
+  maintainWifi();
+
+  /* MQTT */
+
+  if (
+    WiFi.status() ==
+    WL_CONNECTED
+  ) {
     if (
       !client.connected() &&
-      now - lastMqttReconnect >=
+      now -
+        lastMqttReconnect >=
       MQTT_RECONNECT_TIME
     ) {
-      lastMqttReconnect = now;
+      lastMqttReconnect =
+        now;
+
       reconnectMqtt();
     }
 
-    client.loop();
+    if (
+      client.connected()
+    ) {
+      client.loop();
+    }
   }
-  else if (
-    now - lastWifiReconnect >=
-    WIFI_RECONNECT_TIME
-  ) {
-    lastWifiReconnect = now;
-    setupWifi();
-  }
+
+  /* Porte */
 
   handleStateMachine();
+
+  /* Capteurs */
+
   handleSensors();
+
+  /* Bouton GPA2 */
+
   handleButtons();
 
-  if (state == READY) {
+  /* RFID + empreinte */
+
+  if (
+    state ==
+    READY
+  ) {
     handleRfid();
     handleFinger();
   }
 
+  /* Synchronisation SD -> Node-RED */
+
+  processPendingEvents();
+
+  /* Heartbeat */
+
   if (
-    now - lastHeartbeat >=
+    now -
+      lastHeartbeat >=
     HEARTBEAT_TIME
   ) {
-    lastHeartbeat = now;
+    lastHeartbeat =
+      now;
 
     publishMsg(
       topic("status"),
-      WiFi.status() == WL_CONNECTED
-        ? "online"
-        : "offline",
+      WiFi.status() ==
+        WL_CONNECTED
+          ? "online"
+          : "offline",
       true
     );
 
     publishMsg(
-      "sas/" + deviceId + "/status",
-      WiFi.status() == WL_CONNECTED
-        ? "online"
-        : "offline",
+      "sas/" +
+        deviceId +
+        "/status",
+      WiFi.status() ==
+        WL_CONNECTED
+          ? "online"
+          : "offline",
       true
     );
 
     publishAll();
+
     updateLeds();
   }
+
+  delay(2);
 }
